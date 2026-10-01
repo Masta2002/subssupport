@@ -15,12 +15,18 @@
 #    GNU General Public License for more details.
 #
 #################################################################################
-import socket
 import sys
 import time
 import traceback
 
-from .utilities import langToCountry, languageTranslate, SimpleLogger
+from .utilities import languageTranslate, SimpleLogger
+
+try:
+    from requests.exceptions import Timeout as RequestsTimeout
+except ImportError:
+    RequestsTimeout = TimeoutError
+
+TIMEOUT_ERRORS = (RequestsTimeout, TimeoutError)  # socket.timeout is TimeoutError
 
 
 class SubtitlesErrors:
@@ -132,11 +138,11 @@ class BaseSeeker(object):
                 subtitles = {'list': []}
             else:
                 subtitles = self._search(title, filepath, valid_langs, season, episode, tvshow, year)
-        except (socket.timeout, TimeoutError) as e:
+        except TIMEOUT_ERRORS as e:
             self.log.error("timeout error occured: %s" % (str(e)))
             err = SubtitlesSearchError(SubtitlesErrors.TIMEOUT_ERROR, "timeout!")
             err.provider = self.id
-            raise err
+            raise err from e
         except SubtitlesSearchError as e:
             self.log.error("search error occured: %s" % str(e))
             e.provider = self.id
@@ -145,13 +151,13 @@ class BaseSeeker(object):
             self.log.error("search error occured: %s" % str(e))
             err = SubtitlesSearchError(e.code, e.msg)
             err.provider = self.id
-            raise err
+            raise err from e
         except Exception as e:
             self.log.error("unknown search error occured: %s" % str(e))
             err = SubtitlesSearchError(SubtitlesErrors.UNKNOWN_ERROR, str(e))
             err.provider = self.id
             err.wrapped_error = e
-            raise err
+            raise err from e
         subtitles['id'] = self.id
         subtitles['time'] = time.time() - start_time
         subtitles['params'] = {
@@ -186,10 +192,20 @@ class BaseSeeker(object):
         self.log.info("download - selected_subtitle: %s, path: %s" % (selected_subtitle['filename'], path))
         try:
             compressed, lang, filepath = self._download(subtitles, selected_subtitle, path)
+        except TIMEOUT_ERRORS as e:
+            self.log.error("timeout error occured: %s" % str(e))
+            err = SubtitlesDownloadError(SubtitlesErrors.TIMEOUT_ERROR, "timeout!")
+            err.provider = self.id
+            raise err from e
         except SubtitlesDownloadError as e:
             self.log.error("download error occured: %s" % str(e))
             e.provider = self.id
             raise e
+        except BaseSubtitlesError as e:
+            self.log.error("download error occured: %s" % str(e))
+            err = SubtitlesDownloadError(e.code, e.msg)
+            err.provider = self.id
+            raise err from e
         except Exception:
             exc_value, exc_traceback = sys.exc_info()[1:]
             self.log.error("unknown download error occured: %s" % str(exc_value))
@@ -197,7 +213,7 @@ class BaseSeeker(object):
             err = SubtitlesDownloadError(SubtitlesErrors.UNKNOWN_ERROR, str(exc_value))
             err.provider = self.id
             err.wrapped_error = exc_value
-            raise err
+            raise err from exc_value
 
         self.log.info("download finished, compressed: %s, lang: %s, filepath:%s" % (compressed, lang, filepath))
         return compressed, lang, filepath

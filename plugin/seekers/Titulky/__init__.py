@@ -1,1 +1,1 @@
-from . import service as titulkycom  # noqa: F401
+from . import service as titulkycom

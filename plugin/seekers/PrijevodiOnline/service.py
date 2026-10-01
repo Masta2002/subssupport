@@ -1,39 +1,33 @@
 # -*- coding: utf-8 -*-
 """Prijevodi-Online.org seeker (public JSON API of the 2026 site, no login)."""
-import os
 import re
 
-import requests
-
 from ..seeker import SubtitlesDownloadError, SubtitlesErrors
-from ..utilities import languageTranslate, log
+from ..utilities import createSession, languageTranslate, log, matchTitle, saveSubtitle, wantedLanguages
 
 API_URL = 'https://www.prijevodi-online.org/api/v1/'
 TIMEOUT = 20
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-           'Accept': 'application/json'}
 
 # site language code -> ISO 639-1 ('cnr', 'mix' and '??' have no mapping and are skipped)
 SITE_LANGS = {'bs': 'bs', 'hr': 'hr', 'sr': 'sr', 'sr-cyr': 'sr', 'mk': 'mk', 'en': 'en'}
 
+session = createSession()
+session.headers['Accept'] = 'application/json'
+
 
 def _get(path, **params):
-    r = requests.get(API_URL + path, params=params, headers=HEADERS, timeout=TIMEOUT)
+    r = session.get(API_URL + path, params=params, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
 def _pick(items, name, year=None):
-    """Prefer an exact (case-insensitive) title match, then the year."""
-    name = name.strip().lower()
-    exact = [i for i in items if name in ((i.get('title') or '').lower(), (i.get('originalTitle') or '').lower())]
-    if year:
-        dated = [i for i in exact or items if (i.get('releaseDate') or '')[:4] == str(year)]
-        if dated:
-            return dated[0]
-    if exact:
-        return exact[0]
-    return items[0] if len(items) == 1 else None
+    """Best title or original title match."""
+    results = []
+    for item in items:
+        found_year = (item.get('releaseDate') or '')[:4] or None
+        results += [(item.get('title'), found_year, item), (item.get('originalTitle'), found_year, item)]
+    return matchTitle(name, year, results)
 
 
 def _episode_translations(tvshow, season, episode):
@@ -67,8 +61,8 @@ def _movie_translations(title, year):
     return items
 
 
-def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):  # standard input
-    codes = {languageTranslate(lang, 0, 2) for lang in (lang1, lang2, lang3)}
+def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
+    codes = wantedLanguages(lang1, lang2, lang3)
     if tvshow:
         if not (int(season or 0) and int(episode or 0)):
             return [], '', 'season and episode are required'
@@ -83,34 +77,22 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
             continue
         subtitles_list.append({'filename': ' '.join(item['label'].split()),
                                'language_name': languageTranslate(code, 2, 0),
-                               'language_flag': code,
                                'ID': str(item['id']),
                                'kind': item['kind'],
-                               'rating': '0',
-                               'sync': False,
-                               'hearing_imp': bool(item.get('hearingImpaired'))})
+                               'sync': False})
     log(__name__, 'found %d subtitles' % len(subtitles_list))
-    return subtitles_list, '', ''  # standard output
+    return subtitles_list, '', ''
 
 
-def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):  # standard input
+def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):
     params = subtitles_list[pos]
     url = '%stranslations/%s/%s/download' % (API_URL, params['kind'], params['ID'])
     log(__name__, 'downloading %s' % url)
-    r = requests.get(url, headers=dict(HEADERS, Accept='*/*'), timeout=TIMEOUT)
+    r = session.get(url, headers={'Accept': '*/*'}, timeout=TIMEOUT)
     if r.status_code in (401, 402, 403):
         raise SubtitlesDownloadError(SubtitlesErrors.NO_CREDENTIALS_ERROR,
                                      'Prijevodi-Online: this subtitle needs a logged-in account with tokens (HTTP %d)' % r.status_code)
     r.raise_for_status()
-    if r.content[:2] == b'PK':
-        ext = 'zip'
-    elif r.content[:4] == b'Rar!':
-        ext = 'rar'
-    elif r.content.lstrip()[:1] in (b'<', b'{'):
+    if r.content.lstrip()[:1] == b'{':  # json error
         raise SubtitlesDownloadError(SubtitlesErrors.UNKNOWN_ERROR, 'Prijevodi-Online did not return a subtitle file')
-    else:
-        ext = 'srt'
-    path = os.path.join(tmp_sub_dir, 'prijevodionline_%s.%s' % (params['ID'], ext))
-    with open(path, 'wb') as f:
-        f.write(r.content)
-    return False, params['language_name'], path  # standard output
+    return False, params['language_name'], saveSubtitle(tmp_sub_dir, 'prijevodionline_%s' % params['ID'], r.content)

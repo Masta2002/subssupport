@@ -13,40 +13,24 @@ from urllib.parse import quote
 
 import requests
 
-from ..user_agents import get_random_ua
-from ..utilities import log
+from ..utilities import createSession, log, normalizeTitle, romanVariations, saveSubtitle, wantedLanguages, yearMatch
 
 ITEM = "mora25r"
 METADATA_URL = "https://archive.org/metadata/%s" % ITEM
 DOWNLOAD_URL = "https://archive.org/download/%s/" % ITEM
 LANGUAGE = "Arabic"
 SUB_EXTS = ('.srt', '.ass', '.ssa', '.sub')
-CACHE_DIR = "/var/volatile/tmp" if os.path.isdir("/var/volatile/tmp") else tempfile.gettempdir()
-CACHE_FILE = os.path.join(CACHE_DIR, "subssupport_archive_%s.json" % ITEM)
+CACHE_FILE = os.path.join(tempfile.gettempdir(), "subssupport_archive_%s.json" % ITEM)
 CACHE_TIMEOUT = 24 * 3600
+SEARCH_TIMEOUT = 15
+DOWNLOAD_TIMEOUT = 30
 
-ROMAN = (('xx', 20), ('xix', 19), ('xviii', 18), ('xvii', 17), ('xvi', 16), ('xv', 15), ('xiv', 14), ('xiii', 13),
-         ('xii', 12), ('xi', 11), ('x', 10), ('ix', 9), ('viii', 8), ('vii', 7), ('vi', 6), ('v', 5), ('iv', 4),
-         ('iii', 3), ('ii', 2))
-ROMAN_TO_INT = dict((r, str(n)) for r, n in ROMAN)
-INT_TO_ROMAN = dict((str(n), r) for r, n in ROMAN)
+session = createSession()
 
 
 def normalize(text):
     """'The Matrix: Reloaded' -> 'the.matrix.reloaded'"""
-    text = re.sub(r"['`]", '', text.lower()).replace('&', 'and')
-    return '.'.join(re.findall(r'[^\W_]+', text))
-
-
-def title_variations(title):
-    """Title with Roman numerals as digits and vice versa ('rocky.ii' -> 'rocky.2'), 'I' is left alone."""
-    words = normalize(title).split('.')
-    variations = ['.'.join(words)]
-    for table in (ROMAN_TO_INT, INT_TO_ROMAN):
-        variant = '.'.join(table.get(w, w) for w in words)
-        if variant not in variations:
-            variations.append(variant)
-    return variations
+    return normalizeTitle(text).replace(' ', '.')
 
 
 def read_cache():
@@ -66,7 +50,7 @@ def get_file_list():
     if names is not None:
         return names
     try:
-        r = requests.get(METADATA_URL, headers={'User-Agent': get_random_ua()}, timeout=15)
+        r = session.get(METADATA_URL, timeout=SEARCH_TIMEOUT)
         r.raise_for_status()
         names = [f['name'] for f in r.json().get('files', []) if f.get('name', '').lower().endswith(SUB_EXTS)]
     except (requests.RequestException, ValueError) as e:
@@ -82,17 +66,17 @@ def get_file_list():
 
 def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
     name = tvshow or title
-    if LANGUAGE not in (lang1, lang2, lang3) or not name or not name.strip():
+    if 'ar' not in wantedLanguages(lang1, lang2, lang3) or not name or not name.strip():
         return [], "", ""
     episode_tag = ".s%02de%02d." % (int(season), int(episode)) if tvshow else None
-    prefixes = [v + '.' for v in title_variations(name)]
+    prefixes = ['.'.join(words) + '.' for words in romanVariations(normalize(name).split('.'))]
     hits, year_hits = [], []
     for filename in get_file_list():
         norm = normalize(filename) + '.'
         if not any(norm.startswith(p) for p in prefixes) or episode_tag and episode_tag not in norm:
             continue
         hits.append(filename)
-        if year and '.%s.' % year in norm:
+        if year and any(yearMatch(y, year) for y in re.findall(r'\.((?:19|20)\d\d)(?=\.)', norm)):
             year_hits.append(filename)
     log(__name__, "%d files match %s (%d with year %s)" % (len(hits), prefixes, len(year_hits), year))
     subtitles_list = [{'filename': os.path.splitext(f)[0], 'id': f, 'language_name': LANGUAGE, 'sync': False}
@@ -102,11 +86,6 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
 
 def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):
     sub = subtitles_list[pos]
-    r = requests.get(DOWNLOAD_URL + quote(sub['id']), headers={'User-Agent': get_random_ua()}, timeout=30)
+    r = session.get(DOWNLOAD_URL + quote(sub['id']), timeout=DOWNLOAD_TIMEOUT)
     r.raise_for_status()
-    if not r.content:
-        raise Exception("empty subtitle file")
-    path = os.path.join(tmp_sub_dir, os.path.basename(sub['id']))
-    with open(path, 'wb') as f:
-        f.write(r.content)
-    return False, sub['language_name'], path
+    return False, sub['language_name'], saveSubtitle(tmp_sub_dir, sub['id'], r.content)

@@ -1,1 +1,1 @@
-from . import service as prijevodionline  # noqa: F401
+from . import service as prijevodionline

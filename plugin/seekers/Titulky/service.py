@@ -5,20 +5,17 @@ Search is public. Download works anonymously until the daily per-IP limit is
 reached, then titulky.com asks for a captcha (handed to captcha_cb). Logged-in
 users (Titulkyuser/Titulkypass) get a higher limit.
 """
+import html
 import os
 import re
 import time
 from urllib.parse import urljoin
 
-import requests
-
 from ..seeker import SubtitlesDownloadError, SubtitlesErrors
-from ..utilities import languageTranslate, log
+from ..utilities import createSession, languageTranslate, log, saveSubtitle, wantedLanguages, yearMatch
 
 SERVER_URL = 'https://www.titulky.com/'
 TIMEOUT = 20
-
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'}
 
 # set by XBMCSubtitlesAdapter
 settings_provider = None
@@ -31,9 +28,12 @@ ROW_RE = re.compile(r'<tr class="r[^"]*">(.*?)</tr>', re.S | re.I)
 CELL_RE = re.compile(r'<td[^>]*>(.*?)</td>', re.S | re.I)
 TAG_RE = re.compile(r'<[^>]+>')
 
+session = createSession()
+_logged_in = None  # (username, password) of the session login
 
-def _text(html):
-    return ' '.join(TAG_RE.sub(' ', html).replace('&nbsp;', ' ').split())
+
+def _text(cell):
+    return ' '.join(html.unescape(TAG_RE.sub(' ', cell)).split())
 
 
 def _parse_row(row):
@@ -48,22 +48,23 @@ def _parse_row(row):
     downloads = _text(cells[4])
     return {'ID': link.group(1),
             'title': _text(cells[0]),
-            'release': release.group(1).strip() if release else '',
+            'release': html.unescape(release.group(1)).strip() if release else '',
             'episode': _text(cells[2]),
             'year': _text(cells[3]),
             'downloads': int(downloads) if downloads.isdigit() else 0,
             'lang': lang.group(1).upper()}
 
 
-def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):  # standard input
-    codes = {languageTranslate(lang, 0, 2) for lang in (lang1, lang2, lang3)}
+def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
+    wanted = wantedLanguages(lang1, lang2, lang3)
     if tvshow:
-        query = '%s S%02dE%02d' % (tvshow, int(season or 0), int(episode or 0))
+        tag = 'S%02dE%02d' % (int(season or 0), int(episode or 0))
+        query = '%s %s' % (tvshow, tag)
     else:
         # filter titles like <Localized movie name> (<Movie name>)
         query = title.split('(')[0].strip()
     log(__name__, 'searching for "%s"' % query)
-    r = requests.get(SERVER_URL + 'index.php', params={'Fulltext': query, 'FindUser': ''}, headers=HEADERS, timeout=TIMEOUT)
+    r = session.get(SERVER_URL + 'index.php', params={'Fulltext': query, 'FindUser': ''}, timeout=TIMEOUT)
     r.raise_for_status()
 
     file_name = os.path.basename(file_original_path or '').lower()
@@ -73,36 +74,41 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
         if not item:
             continue
         code = LANGS.get(item['lang'])
-        if code not in codes:
+        if code not in wanted:
             continue
-        if year and not tvshow and item['year'] and item['year'] != str(year):
+        if not tvshow and not yearMatch(item['year'], year):
             continue
-        if tvshow and item['episode'].upper() != query[-6:].upper():
+        if tvshow and item['episode'].upper() != tag:
             continue
         release = item['release']
         item.update({'filename': '%s %s' % (item['title'], release) if release else item['title'],
                      'language_name': languageTranslate(code, 2, 0),
-                     'language_flag': code,
                      'sync': bool(release and file_name and release.lower() in file_name)})
         subtitles_list.append(item)
-    max_downloads = max([s['downloads'] for s in subtitles_list] + [1])
-    for sub in subtitles_list:
-        sub['rating'] = str(sub['downloads'] * 10 // max_downloads)
+    subtitles_list.sort(key=lambda s: (not s['sync'], -s['downloads']))
     log(__name__, 'found %d subtitles' % len(subtitles_list))
-    return subtitles_list, '', ''  # standard output
+    return subtitles_list, '', ''
 
 
-def _login(session, username, password):
+def _login():
+    """Logs the session in once when username/password are set."""
+    global _logged_in
+    username = settings_provider.getSetting('Titulkyuser')
+    password = settings_provider.getSetting('Titulkypass')
+    if not username or not password or _logged_in == (username, password) and session.cookies.get('LogonLogin'):
+        return
     log(__name__, 'logging in as %s' % username)
+    _logged_in = None
     r = session.post(SERVER_URL + 'index.php', data={'Login': username, 'Password': password, 'foreverlog': '0', 'Detail2': ''},
                      timeout=TIMEOUT)
     r.raise_for_status()
     if 'BadLogin' in r.text or not session.cookies.get('LogonLogin'):
         raise SubtitlesDownloadError(SubtitlesErrors.INVALID_CREDENTIALS_ERROR,
                                      'Login to Titulky.com failed, check username/password in the provider settings')
+    _logged_in = (username, password)
 
 
-def _solve_captcha(session, subtitle_id, tmp_sub_dir):
+def _solve_captcha(subtitle_id, tmp_sub_dir):
     if not callable(captcha_cb):
         raise SubtitlesDownloadError(SubtitlesErrors.CAPTCHA_RETYPE_ERROR, 'Titulky.com daily limit reached, captcha required')
     log(__name__, 'daily limit reached, asking user for captcha')
@@ -122,22 +128,16 @@ def _solve_captcha(session, subtitle_id, tmp_sub_dir):
     return r.text
 
 
-def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):  # standard input
+def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):
     params = subtitles_list[pos]
     subtitle_id = params['ID']
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    username = settings_provider.getSetting('Titulkyuser')
-    password = settings_provider.getSetting('Titulkypass')
-    if username and password:
-        _login(session, username, password)
-
+    _login()
     r = session.get(SERVER_URL + 'idown.php', params={'R': str(int(time.time())), 'titulky': subtitle_id, 'histstamp': '', 'zip': 'z'},
                     timeout=TIMEOUT)
     r.raise_for_status()
     content = r.text
     if 'captcha/captcha.php' in content:
-        content = _solve_captcha(session, subtitle_id, tmp_sub_dir)
+        content = _solve_captcha(subtitle_id, tmp_sub_dir)
     if 'CHYBA' in content:
         raise SubtitlesDownloadError(SubtitlesErrors.NO_CREDENTIALS_ERROR, 'Titulky.com refused the download, login required')
     link = re.search(r'id="downlink"\s+href="([^"]+)"', content) or re.search(r'href="([^"]+)"[^>]*id="downlink"', content)
@@ -152,17 +152,6 @@ def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, s
         else:
             time.sleep(wait + 1)
 
-    r = session.get(urljoin(SERVER_URL, link.group(1).replace('&amp;', '&')), timeout=TIMEOUT)
+    r = session.get(urljoin(SERVER_URL, html.unescape(link.group(1))), timeout=TIMEOUT)
     r.raise_for_status()
-    if r.content[:2] == b'PK':
-        ext = 'zip'
-    elif r.content[:4] == b'Rar!':
-        ext = 'rar'
-    elif r.content.lstrip()[:1] == b'<':
-        raise SubtitlesDownloadError(SubtitlesErrors.UNKNOWN_ERROR, 'Titulky.com did not return a subtitle file')
-    else:
-        ext = 'srt'
-    path = os.path.join(tmp_sub_dir, 'titulky_%s.%s' % (subtitle_id, ext))
-    with open(path, 'wb') as f:
-        f.write(r.content)
-    return False, params['language_name'], path  # standard output
+    return False, params['language_name'], saveSubtitle(tmp_sub_dir, 'titulky_%s' % subtitle_id, r.content)

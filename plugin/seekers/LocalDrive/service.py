@@ -2,9 +2,8 @@
 # Finds subtitles in the configured search path and next to the played video file
 import os
 import re
-import shutil
 
-from ..utilities import languageTranslate, log
+from ..utilities import languageTranslate, log, saveSubtitle, yearMatch
 
 SUBTITLE_EXTENSIONS = (".srt", ".sub")
 MAX_DEPTH = 3
@@ -62,7 +61,8 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
             joined = "".join(words)
             if not all(w in words for w in title_words) or (episode_tag and episode_tag not in joined):
                 continue
-            if year and not tvshow and re.search(r"(19|20)\d{2}", name) and str(year) not in name:
+            found_year = re.search(r"(?:19|20)\d{2}", name)
+            if not tvshow and found_year and not yearMatch(found_year.group(0), year):
                 continue
             language = _language(name)
             if language and langs and language not in langs:
@@ -80,8 +80,6 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
 
 def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):
     subtitle = subtitles_list[pos]
-    if not os.path.isdir(tmp_sub_dir):
-        os.makedirs(tmp_sub_dir)
-    filepath = os.path.join(tmp_sub_dir, subtitle["filename"])
-    shutil.copyfile(subtitle["path"], filepath)
+    with open(subtitle["path"], "rb") as f:
+        filepath = saveSubtitle(tmp_sub_dir, subtitle["filename"], f.read())
     return False, subtitle["language_name"], filepath

@@ -2,7 +2,6 @@
 """subtitlecat.com: every subtitle has an original language plus machine translations
 that were already generated on the site (new translations need JavaScript, so only
 existing ones are offered)."""
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urljoin
@@ -10,30 +9,20 @@ from urllib.parse import unquote, urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from ..user_agents import get_random_ua
-from ..utilities import languageTranslate, log
+from ..utilities import createSession, langCode, log, saveSubtitle, wantedLanguages
 
 MAIN_URL = "https://www.subtitlecat.com/"
+SEARCH_TIMEOUT = 15
+DOWNLOAD_TIMEOUT = 30
 # ISO 639-1 codes that differ on the site
-SITE_CODES = {'he': 'iw', 'zh': 'zh-CN', 'pb': 'pt-BR'}
+SITE_CODES = {'he': 'iw', 'zh': 'zh-CN', 'pt-br': 'pt-BR'}
 MT_PAGES = 8  # detail pages checked for ready machine translations
 
-session = requests.Session()
-session.headers.update({'User-Agent': get_random_ua(), 'Referer': MAIN_URL})
-
-
-def wanted_languages(*names):
-    """{ISO 639-1 code: requested language name} for the requested languages known to the plugin."""
-    wanted = {}
-    for name in reversed(names):
-        code = languageTranslate(name, 0, 2) if name else None
-        if code:
-            wanted['pb' if code == 'pt-br' else code] = name
-    return wanted
+session = createSession(MAIN_URL)
 
 
 def search(query):
-    r = session.get(MAIN_URL + "index.php", params={'search': query}, timeout=15)
+    r = session.get(MAIN_URL + "index.php", params={'search': query}, timeout=SEARCH_TIMEOUT)
     r.raise_for_status()
     rows = []
     for td in BeautifulSoup(r.text, 'html.parser').select('tr > td:first-child'):
@@ -42,14 +31,14 @@ def search(query):
             continue
         m = re.search(r'\(translated from ([^)]+)\)', td.get_text(' ', strip=True))
         orig = m.group(1).strip() if m else '?'
-        rows.append((a.get_text(strip=True), urljoin(MAIN_URL, a['href']), orig, languageTranslate(orig, 0, 2)))
+        rows.append((a.get_text(strip=True), urljoin(MAIN_URL, a['href']), orig, langCode(orig)))
     log(__name__, "%d results for '%s'" % (len(rows), query))
     return rows
 
 
 def get_page_links(url):
     """{site language code: download url} of a subtitle page, '' = original file."""
-    r = session.get(url, timeout=15)
+    r = session.get(url, timeout=SEARCH_TIMEOUT)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, 'html.parser')
     links = dict((a['id'][9:], urljoin(MAIN_URL, a['href']))
@@ -61,7 +50,7 @@ def get_page_links(url):
 
 
 def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
-    wanted = wanted_languages(lang1, lang2, lang3)
+    wanted = wantedLanguages(lang1, lang2, lang3)
     if tvshow:
         rows = search("%s S%02dE%02d" % (tvshow, int(season), int(episode)))
     else:
@@ -72,11 +61,12 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
     candidates = [row for row in rows if set(wanted) - {row[3]}][:MT_PAGES]
     with ThreadPoolExecutor(4) as pool:
         pages = list(pool.map(lambda row: _safe(get_page_links, row[1]), candidates))
-    for (name, url, orig, orig_code), links in zip(candidates, pages):
+    for (name, url, orig, orig_code), links in zip(candidates, pages, strict=True):
         for code, lang in wanted.items():
-            if code != orig_code and SITE_CODES.get(code, code) in links:
+            link = links.get(SITE_CODES.get(code, code))
+            if code != orig_code and link:
                 subtitles_list.append({'filename': "%s [machine translated from %s]" % (name, orig), 'url': url,
-                                       'language_name': lang, 'code': code, 'translated': True, 'sync': False})
+                                       'link': link, 'language_name': lang, 'code': code, 'sync': False})
     return subtitles_list, "", ""
 
 
@@ -90,17 +80,14 @@ def _safe(func, *args):
 
 def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):
     sub = subtitles_list[pos]
-    links = get_page_links(sub['url'])
-    url = links.get(SITE_CODES.get(sub['code'], sub['code']))
-    if not url and not sub.get('translated'):
-        url = links.get('')  # original file
+    url = sub.get('link')  # machine translations were resolved by the search
     if not url:
-        raise Exception(f"no {sub['language_name']} subtitle on {sub['url']}")
-    r = session.get(url, timeout=30)
+        links = get_page_links(sub['url'])
+        url = links.get(SITE_CODES.get(sub['code'], sub['code'])) or links.get('')  # else the original file
+    if not url:
+        raise Exception("no %s subtitle on %s" % (sub['language_name'], sub['url']))
+    r = session.get(url, timeout=DOWNLOAD_TIMEOUT)
     r.raise_for_status()
     if b'-->' not in r.content:  # some files are (translated) error pages
-        raise Exception(f"no subtitle in {url}")
-    path = os.path.join(tmp_sub_dir, os.path.basename(unquote(url)))
-    with open(path, 'wb') as f:
-        f.write(r.content)
-    return False, sub['language_name'], path
+        raise Exception("no subtitle in %s" % url)
+    return False, sub['language_name'], saveSubtitle(tmp_sub_dir, unquote(url), r.content)

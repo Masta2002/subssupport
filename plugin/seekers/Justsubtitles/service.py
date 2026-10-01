@@ -5,10 +5,7 @@ import json
 import os
 import re
 
-import requests
-
-from ..user_agents import get_random_ua
-from ..utilities import languageTranslate, log
+from ..utilities import createSession, log, matchTitle, normalizeTitle, saveSubtitle, stripYear, wantedLanguages
 
 MAIN_URL = "https://www.justsubtitles.com"
 SEARCH_URL = "https://search.justsubtitles.com/api/search"
@@ -19,28 +16,19 @@ DOWNLOAD_TIMEOUT = 30
 SITE_LANGS = {'en': 'English', 'ar': 'Arabic', 'de': 'German', 'it': 'Italian', 'id': 'Indonesian',
               'ja': 'Japanese', 'ko': 'Korean'}
 
-session = requests.Session()
-session.headers.update({'User-Agent': get_random_ua(), 'Referer': MAIN_URL + '/'})
+session = createSession(MAIN_URL + '/')
 _action_ids = {}  # page chunk url -> "findSubsForLang" server action id (changes with every site deployment)
-
-
-def normalize(title):
-    return re.sub(r'[^a-z0-9]+', ' ', (title or '').lower()).strip()
 
 
 def find_movie(title, year):
     """Returns (tmdb_id, year) of the best matching movie or (None, None)."""
     r = session.get(SEARCH_URL, params={'q': title}, timeout=TIMEOUT)
     r.raise_for_status()
-    wanted, candidates = normalize(title), []
+    results = []
     for movie in r.json().get('results') or []:
         found = (movie.get('id'), (movie.get('release_date') or '')[:4])
-        names = (normalize(movie.get('title')), normalize(movie.get('original_title')))
-        match = 2 if wanted in names else any(wanted in name for name in names)
-        if match:
-            candidates.append((match * 2 + (found[1] == str(year)), found))
-    candidates.sort(key=lambda c: -c[0])
-    return candidates[0][1] if candidates else (None, None)
+        results += [(movie.get('title'), found[1], found), (movie.get('original_title'), found[1], found)]
+    return matchTitle(title, year, results) or (None, None)
 
 
 def get_action_id(tmdb_id):
@@ -77,12 +65,9 @@ def find_subs(action_id, tmdb_id, code, year):
 def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
     if tvshow:  # the site only lists movies
         return [], "", ""
-    codes = []
-    for lang in (lang1, lang2, lang3):
-        code = languageTranslate(lang, 0, 2)
-        if code in SITE_LANGS and code not in codes:
-            codes.append(code)
-    if not codes or not title:
+    wanted = dict((code, name) for code, name in wantedLanguages(lang1, lang2, lang3).items() if code in SITE_LANGS)
+    title = stripYear(title)
+    if not wanted or not title:
         return [], "", ""
     tmdb_id, found_year = find_movie(title, year)
     log(__name__, "search '%s' (%s) -> tmdb %s" % (title, year, tmdb_id))
@@ -90,17 +75,17 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
         return [], "", ""
     action_id = get_action_id(tmdb_id)
     year = found_year or year or ''
-    video = normalize(os.path.splitext(os.path.basename(file_original_path or ''))[0])
+    video = normalizeTitle(os.path.splitext(os.path.basename(file_original_path or ''))[0])
     subtitles_list = []
-    for code in codes:
+    for code, lang in wanted.items():
         for sub in find_subs(action_id, tmdb_id, code, year):
             if not sub.get('url'):
                 continue
             name = sub.get('release_name') or sub.get('name') or title
             # old ".rar" entries answer 404/502, subdl serves every upload as ".zip" now
             url = re.sub(r'\.rar$', '.zip', sub['url'].split('?')[0])
-            subtitles_list.append({'filename': name, 'language_name': languageTranslate(code, 2, 0),
-                                   'sync': bool(video) and normalize(name) == video,
+            subtitles_list.append({'filename': name, 'language_name': lang,
+                                   'sync': bool(video) and normalizeTitle(name) == video,
                                    'url': url, 'movie': title, 'year': year, 'tmdb_id': tmdb_id})
     return subtitles_list, "", ""
 
@@ -111,12 +96,5 @@ def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, s
     r = session.get(MAIN_URL + '/api/download', timeout=DOWNLOAD_TIMEOUT, params={
         'url': sub['url'], 'moviename': sub['movie'], 'year': sub['year'], 'backdrop': '', 'movieId': sub['tmdb_id']})
     r.raise_for_status()
-    if not r.content or r.content.lstrip()[:1] == b'<':
-        raise Exception('justsubtitles: download returned no subtitle file')
-    if not os.path.isdir(tmp_sub_dir):
-        os.makedirs(tmp_sub_dir)
     name = os.path.splitext(os.path.basename(sub['url']))[0] or 'subtitle'
-    filepath = os.path.join(tmp_sub_dir, name + ('.rar' if r.content[:4] == b'Rar!' else '.zip'))
-    with open(filepath, 'wb') as f:
-        f.write(r.content)
-    return False, sub['language_name'], filepath
+    return False, sub['language_name'], saveSubtitle(tmp_sub_dir, name, r.content)

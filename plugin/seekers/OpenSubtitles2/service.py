@@ -6,14 +6,14 @@ import requests
 
 from ..seeker import SubtitlesDownloadError, SubtitlesErrors
 from ..user_agents import get_api_user_agent
-from ..utilities import languageTranslate, hashFile, log
+from ..utilities import downloadRating, hashFile, languageTranslate, log, saveSubtitle, wantedLanguages
 
 API_URL = "https://api.opensubtitles.com/api/v1"
 API_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 30
 
 # our iso639-1 codes -> OpenSubtitles language codes
-OS_LANG_CODES = {"pb": "pt-br", "pt": "pt-pt", "zh": "zh-cn"}
+OS_LANG_CODES = {"pt": "pt-pt", "zh": "zh-cn"}
 
 settings_provider = None
 _token = {}  # (api_key, username) -> (token, api_url)
@@ -67,19 +67,16 @@ def test_credentials():
     return "Login OK, downloads left today: %s/%s" % (data.get("remaining_downloads", "?"), data.get("allowed_downloads", "?"))
 
 
-def _lang_code(name):
-    code = languageTranslate(name, 0, 2)
-    return OS_LANG_CODES.get(code, code)
-
-
 def _lang_name(code):
-    code = "pb" if code == "pt-br" else code.split("-")[0]
+    code = code.lower()
+    if code != "pt-br":  # pt-pt, zh-cn, zh-tw
+        code = code.split("-")[0]
     return languageTranslate(code, 2, 0) or code
 
 
 def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
     api_key = _api_key()
-    langs = sorted(set(filter(None, (_lang_code(lang) for lang in (lang1, lang2, lang3) if lang))))
+    langs = sorted(set(OS_LANG_CODES.get(code, code) for code in wantedLanguages(lang1, lang2, lang3)))
     params = {"languages": ",".join(langs)}
     if tvshow:
         params.update({"query": tvshow, "type": "episode"})
@@ -93,7 +90,7 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
             params["year"] = int(year)
     if file_original_path and os.path.isfile(file_original_path):
         try:
-            params["moviehash"] = hashFile(file_original_path, rar)[1]
+            params["moviehash"] = hashFile(file_original_path)[1]
         except Exception as e:
             log(__name__, "hash calculation failed: %s" % e)
     # the API answers with a redirect unless the parameters are lowercase and sorted
@@ -110,14 +107,12 @@ def search_subtitles(file_original_path, title, tvshow, year, season, episode, s
         files = attributes.get("files") or []
         if not files:
             continue
-        downloads = int(attributes.get("download_count") or 0)
         subtitles_list.append({
             "id": files[0]["file_id"],
             "filename": attributes.get("release") or files[0].get("file_name") or title,
             "language_name": _lang_name(attributes.get("language") or ""),
             "sync": bool(attributes.get("moviehash_match")),
-            "rating": str(min(10, downloads // 50 + 1)),
-            "no_files": len(files),
+            "rating": downloadRating(attributes.get("download_count")),
         })
     subtitles_list.sort(key=lambda s: (not s["sync"], -int(s["rating"])))
     return subtitles_list, "", ""
@@ -139,10 +134,5 @@ def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, s
     log(__name__, "remaining downloads: %s" % data.get("remaining"))
     content = requests.get(data["link"], headers={"User-Agent": get_api_user_agent()}, timeout=DOWNLOAD_TIMEOUT)
     content.raise_for_status()
-    filename = os.path.basename(data.get("file_name") or "%s.srt" % subtitle["id"])
-    if not os.path.isdir(tmp_sub_dir):
-        os.makedirs(tmp_sub_dir)
-    filepath = os.path.join(tmp_sub_dir, filename)
-    with open(filepath, "wb") as f:
-        f.write(content.content)
+    filepath = saveSubtitle(tmp_sub_dir, data.get("file_name") or "%s.srt" % subtitle["id"], content.content)
     return False, subtitle["language_name"], filepath

@@ -4,9 +4,8 @@ Created on Feb 10, 2014
 @author: marko
 '''
 import os
-from time import sleep
 
-from .seeker import BaseSeeker
+from .seeker import BaseSeeker, SubtitlesErrors, SubtitlesSearchError
 from .utilities import languageTranslate, allLang
 
 from . import _
@@ -27,16 +26,13 @@ class XBMCSubtitlesAdapter(BaseSeeker):
         # were provided. If provider has more than 3 supported languages this just
         # gets first three languages in supported_langs list, so most of the time its
         # best to pass languages which will be used for searching
-        if len(self.supported_langs) == 1:
-            self.lang1 = self.lang2 = self.lang3 = languageTranslate(self.supported_langs[0], 2, 0)
-        elif len(self.supported_langs) == 2:
-            self.lang1 = languageTranslate(self.supported_langs[0], 2, 0)
-            self.lang2 = languageTranslate(self.supported_langs[1], 2, 0)
-            self.lang3 = self.lang1
-        else:
-            self.lang1 = languageTranslate(self.supported_langs[0], 2, 0)
-            self.lang2 = languageTranslate(self.supported_langs[1], 2, 0)
-            self.lang3 = languageTranslate(self.supported_langs[2], 2, 0)
+        self.lang1, self.lang2, self.lang3 = self._lang_names(self.supported_langs)
+
+    @staticmethod
+    def _lang_names(langs):
+        """Names of the first three languages, repeated to fill lang1-lang3 ([a, b] -> [a, b, a])."""
+        names = [languageTranslate(lang, 2, 0) for lang in langs[:3]]
+        return (names * 3)[:3]
 
     # settings keys which must be filled in before searching (API keys)
     required_settings = ()
@@ -57,7 +53,7 @@ class XBMCSubtitlesAdapter(BaseSeeker):
     def _search(self, title, filepath, langs, season, episode, tvshow, year):
         missing = [self.default_settings[key]['label'] for key in self.required_settings if not self.settings_provider.getSetting(key).strip()]
         if missing:
-            return {'list': [], 'session_id': "", 'msg': _("%s requires: %s") % (self.provider_name, ", ".join(missing))}
+            raise SubtitlesSearchError(SubtitlesErrors.NO_CREDENTIALS_ERROR, _("%s requires: %s") % (self.provider_name, ", ".join(missing)))
         file_original_path = filepath and filepath or ""
         title = title and title or file_original_path
         season = season if season else 0
@@ -66,20 +62,11 @@ class XBMCSubtitlesAdapter(BaseSeeker):
         year = year if year else ""
         if len(langs) > 3:
             self.log.info('more then three languages provided, only first three will be selected')
-        if len(langs) == 0:
+        if langs:
+            lang1, lang2, lang3 = self._lang_names(langs)
+        else:
             self.log.info('no languages provided will use default ones')
-            lang1 = self.lang1
-            lang2 = self.lang2
-            lang3 = self.lang3
-        elif len(langs) == 1:
-            lang1 = lang2 = lang3 = languageTranslate(langs[0], 2, 0)
-        elif len(langs) == 2:
-            lang1 = lang3 = languageTranslate(langs[0], 2, 0)
-            lang2 = languageTranslate(langs[1], 2, 0)
-        elif len(langs) == 3:
-            lang1 = languageTranslate(langs[0], 2, 0)
-            lang2 = languageTranslate(langs[1], 2, 0)
-            lang3 = languageTranslate(langs[2], 2, 0)
+            lang1, lang2, lang3 = self.lang1, self.lang2, self.lang3
         self.log.info('using langs %s %s %s' % (lang1, lang2, lang3))
         self.module.settings_provider = self.settings_provider
         # Standard output -
@@ -96,6 +83,7 @@ class XBMCSubtitlesAdapter(BaseSeeker):
         pos = subtitles_list.index(selected_subtitle)
         zip_subs = os.path.join(self.tmp_path, selected_subtitle['filename'])
         tmp_sub_dir = self.tmp_path
+        os.makedirs(tmp_sub_dir, exist_ok=True)
         if path is not None:
             sub_folder = path
         else:
@@ -403,7 +391,6 @@ class MoviesubtitlesSeeker(XBMCSubtitlesAdapter):
     if isinstance(module, Exception):
         error, module = module, None
     provider_name = 'Moviesubtitles.org'
-    default_settings = {}
     supported_langs = ['en', 'fr', 'de', 'es', 'it', 'pl', 'ru', 'uk', 'hu', 'tr', 'el', 'ar', 'pt-br']
     default_settings = {}
     movie_search = True
