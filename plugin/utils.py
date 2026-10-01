@@ -1,4 +1,3 @@
-from __future__ import print_function
 import os
 
 from urllib.request import Request, urlopen
@@ -101,34 +100,30 @@ class SimpleLogger(object):
 
     def error(self, text, *args):
         if self.log_level >= self.LOG_ERROR:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[error] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def info(self, text, *args):
         if self.log_level >= self.LOG_INFO:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[info] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def debug(self, text, *args):
         if self.log_level == self.LOG_DEBUG:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[debug] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def _eval_message(self, text, *args):
-        if len(args) == 1 and isinstance(args[0], tuple):
-                text = text % args[0]
-        elif len(args) >= 1:
-            text = text % tuple([a for a in args])
-        return text
+        return text % args if args else text
 
     def _format_output(self, text):
-            return self.LOG_FORMAT.format(self.prefix_name, text)
+        return self.LOG_FORMAT.format(self.prefix_name, text)
 
     def _out_fnc(self, text):
         print(text)

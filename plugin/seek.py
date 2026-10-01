@@ -17,7 +17,7 @@
 #################################################################################
 
 import os
-from re import sub
+from re import split, sub
 import shutil
 import socket
 import threading
@@ -82,7 +82,7 @@ class ErrorSeeker(BaseSeeker):
 
 
 class SubsSeeker(object):
-    SUBTILES_EXTENSIONS = ['.srt', '.sub']
+    SUBTILES_EXTENSIONS = ['.srt', '.sub', '.ass', '.ssa']
 
     def __init__(self, download_path, tmp_path, captcha_cb, delay_cb, message_cb, settings=None, settings_provider_cls=None, settings_provider_args=None, debug=False, providers=None):
         self.log = SimpleLogger(self.__class__.__name__, log_level=debug and SimpleLogger.LOG_DEBUG or SimpleLogger.LOG_INFO)
@@ -94,8 +94,6 @@ class SubsSeeker(object):
             provider_id = seeker.id
             default_settings = seeker.default_settings
             default_settings['enabled'] = {'type': 'yesno', 'default': True, 'label': 'Enabled', 'pos': -1}
-            if provider_id == 'opensubtitles':
-                default_settings = {'user_agent': {'default': 'subssupportuseragent', 'type': 'text', 'pos': 0, 'label': 'User_agent'}, 'enabled': {'default': True, 'type': 'yesno', 'pos': -1, 'label': 'Enabled'}}
             if settings_provider_cls is not None:
                 settings = None
                 settings_provider = settings_provider_cls(provider_id, default_settings, settings_provider_args)
@@ -128,6 +126,7 @@ class SubsSeeker(object):
             title, filepath, year, tvshow, season, episode))
         subtitlesDict = {}
         threads = []
+        prevTimeout = socket.getdefaulttimeout()
         socket.setdefaulttimeout(timeout)
         lock = threading.Lock()
         if len(providers) == 1:
@@ -136,7 +135,6 @@ class SubsSeeker(object):
                 provider = self.getProvider(providers[0])
             if provider.error is not None:
                 self.log.debug("provider '%s' has 'error' flag set, skipping...", provider)
-                return subtitlesDict
             else:
                 self._searchSubtitles(lock, subtitlesDict, updateCB, provider, title, filepath, langs, season, episode, tvshow, year)
         else:
@@ -156,7 +154,7 @@ class SubsSeeker(object):
                 time.sleep(0.5)
                 for t in threads:
                     working = working or t.is_alive()
-        socket.setdefaulttimeout(socket.getdefaulttimeout())
+        socket.setdefaulttimeout(prevTimeout)
         return subtitlesDict
 
     def getSubtitlesList(self, subtitles_dict, provider=None, langs=None, synced=False, nonsynced=False):
@@ -213,12 +211,13 @@ class SubsSeeker(object):
         if seeker is None:
             self.log.error('provider for "%s" subtitle was not found', selected_subtitle['filename'])
         lang, filepath = seeker.download(subtitles_dict[provider_id], selected_subtitle)[1:3]
+        if not filepath or not os.path.isfile(filepath):
+            raise SubtitlesDownloadError(msg="download failed (invalid temp file path): %s" % filepath)
         compressed = getCompressedFileType(filepath)
         if compressed:
             subfiles = self._unpack_subtitles(filepath, self.tmp_path)
         else:
             subfiles = [filepath]
-        subfiles = [s for s in subfiles]
         if len(subfiles) == 0:
             self.log.error("no subtitles were downloaded!")
             raise SubtitlesDownloadError(msg="[error] no subtitles were downloaded")
@@ -232,9 +231,9 @@ class SubsSeeker(object):
                 self.log.debug('no subtitles file choosed!')
                 return
             self.log.debug('selected subtitle: "%s"', subfile)
-        ext = os.path.splitext(subfile)[1]
+        ext = os.path.splitext(subfile)[1].lower()
         if ext not in self.SUBTILES_EXTENSIONS:
-            ext = os.path.splitext(selected_subtitle['filename'])[1]
+            ext = os.path.splitext(selected_subtitle['filename'])[1].lower()
             if ext not in self.SUBTILES_EXTENSIONS:
                 ext = '.srt'
         if fname is None:
@@ -243,10 +242,10 @@ class SubsSeeker(object):
             if save_as == 'version':
                 self.log.debug('filename creating by "version" setting')
                 filename = selected_subtitle['filename']
-				# Sanitize the filename to remove slashes and double dots
+                # Sanitize the filename to remove slashes and double dots
                 filename = sub(r'[\\/]', '_', filename)  # Replace slashes with underscores
                 filename = sub(r'\.\.', '.', filename)  # Replace double dots with a single dot
-                if os.path.splitext(filename)[1] not in self.SUBTILES_EXTENSIONS:
+                if os.path.splitext(filename)[1].lower() not in self.SUBTILES_EXTENSIONS:
                     filename = os.path.splitext(filename)[0] + ext
             elif save_as == 'video':
                 self.log.debug('filename creating by "video" setting')
@@ -268,7 +267,7 @@ class SubsSeeker(object):
             download_path = os.path.join(path, filename)
         self.log.debug('download path: "%s"', download_path)
 
-		# Ensure the destination directory exists
+        # Ensure the destination directory exists
         os.makedirs(os.path.dirname(download_path), exist_ok=True)
 
         if os.path.isfile(download_path) and overwrite_cb is not None:
@@ -285,16 +284,12 @@ class SubsSeeker(object):
                     shutil.move(subfile, download_path)
                     return download_path
                 except Exception as e:
-                    self.log.error('moving "%s" to "%s" - %s' % (
-                        os.path.split(subfile)[-2:],
-                        os.path.split(download_path)[-2:], str(e)))
+                    self.log.error('moving "%s" to "%s" - %s', os.path.split(subfile)[-2:], os.path.split(download_path)[-2:], str(e))
                     return subfile
         try:
             shutil.move(subfile, download_path)
         except Exception as e:
-            self.log.error('moving "%s" to "%s" - %s', (
-                os.path.split(subfile)[-2:],
-                os.path.split(download_path)[-2:], str(e)))
+            self.log.error('moving "%s" to "%s" - %s', os.path.split(subfile)[-2:], os.path.split(download_path)[-2:], str(e))
             return subfile
         return download_path
 
@@ -330,7 +325,10 @@ class SubsSeeker(object):
         try:
             subtitles = seeker.search(title, filepath, langs, season, episode, tvshow, year)
         except Exception as e:
-            traceback.print_exc()
+            if isinstance(e, SubtitlesSearchError) and e.code != SubtitlesErrors.UNKNOWN_ERROR:
+                self.log.info('%s: %s', seeker.id, e.msg)  # expected: missing key, bad login, timeout
+            else:
+                traceback.print_exc()
             with lock:
                 subtitlesDict[seeker.id] = {'message': str(e), 'status': False, 'list': []}
                 if updateCB is not None:
@@ -342,52 +340,62 @@ class SubsSeeker(object):
                 if updateCB is not None:
                     updateCB(seeker.id, True, subtitles)
 
-    def _unpack_subtitles(self, filepath, dest_dir, max_recursion=3):
+    def _unpack_subtitles(self, filepath, dest_dir, max_recursion=3, used=None):
+        if used is None:  # lower-case file names already taken in dest_dir
+            used = set([os.path.basename(filepath).lower()])
         compressed = getCompressedFileType(filepath)
         if compressed == 'zip':
             self.log.debug('found "zip" archive, unpacking...')
-            subfiles = self._unpack_zipsub(filepath, dest_dir)
+            subfiles = self._unpack_zipsub(filepath, dest_dir, used)
         elif compressed == 'rar':
             self.log.debug('found "rar" archive, unpacking...')
-            subfiles = self._unpack_rarsub(filepath, dest_dir)
+            subfiles = self._unpack_rarsub(filepath, dest_dir, used)
         else:
             self.log.error('unsupported archive - %s', compressed)
-            raise Exception(_("unsupported archive %s", compressed))
+            raise Exception("unsupported archive %s" % compressed)
+        result = []
         for s in subfiles:
-            if os.path.splitext(s)[1] in ('.rar', '.zip') and max_recursion > 0:
-                subfiles.extend(self._unpack_subtitles(s, dest_dir, max_recursion - 1))
-        subfiles = filter(lambda x: os.path.splitext(x)[1] in self.SUBTILES_EXTENSIONS, subfiles)
-        return subfiles
+            if os.path.splitext(s)[1].lower() in ('.rar', '.zip'):
+                if max_recursion > 0:
+                    result.extend(self._unpack_subtitles(s, dest_dir, max_recursion - 1, used))
+            else:
+                result.append(s)
+        # natural sort, ep2 before ep10
+        result.sort(key=lambda x: [int(t) if t.isdigit() else t.lower() for t in split(r'(\d+)', os.path.basename(x))])
+        return result
 
-    def _unpack_zipsub(self, zip_path, dest_dir):
-        zf = zipfile.ZipFile(zip_path)
-        namelist = zf.namelist()
-        subsfiles = []
-        for subsfn in namelist:
-            if os.path.splitext(subsfn)[1] in self.SUBTILES_EXTENSIONS + ['.rar', '.zip']:
-                filename = os.path.basename(subsfn)
-                outfile = open(os.path.join(dest_dir, filename), 'wb')
-                outfile.write(zf.read(subsfn))
-                outfile.flush()
-                outfile.close()
-                subsfiles.append(os.path.join(dest_dir, filename))
-        return subsfiles
+    def _unpack_zipsub(self, zippath, destdir, used=None):
+        with zipfile.ZipFile(zippath) as zf:
+            return self._extract(zf, zippath, destdir, used)
 
-    def _unpack_rarsub(self, rar_path, dest_dir):
+    def _unpack_rarsub(self, rar_path, dest_dir, used=None):
         try:
             import rarfile
         except ImportError:
             self.log.error('rarfile lib not available -  pip install rarfile')
             raise
-        rf = rarfile.RarFile(rar_path)
-        namelist = rf.namelist()
+        with rarfile.RarFile(rar_path) as rf:
+            return self._extract(rf, rar_path, dest_dir, used)
+
+    def _extract(self, archive, archivePath, destdir, used=None):
+        used = set() if used is None else used
         subsfiles = []
-        for subsfn in namelist:
-            if os.path.splitext(subsfn)[1] in self.SUBTILES_EXTENSIONS + ['.rar', '.zip']:
-                filename = os.path.basename(subsfn)
-                outfile = open(os.path.join(dest_dir, filename), 'wb')
-                outfile.write(rf.read(subsfn))
-                outfile.flush()
-                outfile.close()
-                subsfiles.append(os.path.join(dest_dir, filename))
+        for subsfn in archive.namelist():
+            ext = os.path.splitext(subsfn)[1].lower()
+            if subsfn.endswith('/') or ext not in self.SUBTILES_EXTENSIONS + ['.rar', '.zip']:
+                continue
+            # flatten the path (episode folders) without overwriting other entries
+            filename = subsfn.replace('\\', '/').strip('/').replace('/', '_')
+            if filename.lower() in used:
+                filename = "%s_%s" % (os.path.splitext(os.path.basename(archivePath))[0], filename)
+            name, fext = os.path.splitext(filename)
+            count = 2
+            while filename.lower() in used:
+                filename = "%s_%d%s" % (name, count, fext)
+                count += 1
+            used.add(filename.lower())
+            outpath = os.path.join(destdir, filename)
+            with open(outpath, 'wb') as outfile:
+                outfile.write(archive.read(subsfn))
+            subsfiles.append(outpath)
         return subsfiles

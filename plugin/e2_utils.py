@@ -15,14 +15,12 @@
 #    GNU General Public License for more details.
 #
 #################################################################################
-from __future__ import absolute_import
-from __future__ import print_function
 from . import _
 import os
 import shutil
 import requests
 from twisted.internet.threads import deferToThread
-import xml.etree.cElementTree
+from xml.etree.ElementTree import parse as parse_xml
 from Components.Label import Label
 from Components.ConfigList import ConfigList
 from Components.Sources.StaticText import StaticText
@@ -443,54 +441,62 @@ def getFonts():
     global FONTS
     if len(FONTS) > 0:
         return FONTS.keys()
-    allFonts = []
+
+    fontExts = (".ttf", ".otf")
     fontDir = eEnv.resolve("${datadir}/fonts/")
+    pluginFontDir = os.path.join(os.path.dirname(__file__), "fonts", "")
     print('[getFonts] fontDir: %s' % fontDir)
-    for font in os.listdir(fontDir):
-        fontPath = os.path.join(fontDir, font)
-        if os.path.isdir(fontPath):
-            for f in os.listdir(fontPath):
-                if not f.endswith(".ttf"):
-                    continue
-                allFonts.append(os.path.join(fontPath, f))
-        if not fontPath.endswith(".ttf"):
+    allFonts = []
+    for directory in (fontDir, pluginFontDir):
+        if not os.path.isdir(directory):
             continue
-        allFonts.append(fontPath)
+        for font in os.listdir(directory):
+            fontPath = os.path.join(directory, font)
+            if os.path.isdir(fontPath):
+                allFonts.extend(os.path.join(fontPath, f) for f in os.listdir(fontPath) if f.lower().endswith(fontExts))
+            elif font.lower().endswith(fontExts):
+                allFonts.append(fontPath)
+
     skinFiles = ["skin_default.xml", "skin_subtitles.xml", "skin_user.xml"]
     fonts = {}
     for skinFile in skinFiles:
         skinPath = resolveFilename(SCOPE_SKIN, skinFile)
         if fileExists(skinPath):
             try:
-                skin = xml.etree.cElementTree.parse(skinPath).getroot()
+                skin = parse_xml(skinPath).getroot()
             except Exception as e:
                 print(e)
                 continue
             for c in skin.findall("fonts"):
                 for font in c.findall("font"):
                     get_attr = font.attrib.get
-                    filename = get_attr("filename", "<NONAME>")
+                    filename = get_attr("filename", "")
                     name = get_attr("name", "Regular")
                     fonts[filename] = name
                     print('[getFonts] find font %s in %s' % (name, skinFile))
+
     for fontFilepath in allFonts:
         fontFilename = os.path.basename(fontFilepath)
-        if fontFilename not in fonts.keys():
-            fontName = os.path.splitext(fontFilename)[0]
-            addFont(fontFilepath, fontName, 100, False)
-            FONTS[fontName] = fontFilepath
-        else:
+        fontName = os.path.splitext(fontFilename)[0]
+        if fontFilepath.startswith(pluginFontDir):
+            fontName = "SS_" + fontName  # plugin fonts, avoid clashes with system/skin fonts
+        elif fontFilename in fonts:
             FONTS[fonts[fontFilename]] = fontFilename
+            continue
+        addFont(fontFilepath, fontName, 100, False)
+        FONTS[fontName] = fontFilepath
+
     if "Regular" not in FONTS:
         FONTS["Regular"] = ""
+
     return FONTS.keys()
 
 
 class BaseMenuScreen(Screen, ConfigListScreen):
 
-    def __init__(self, session, title):
+    def __init__(self, session, title, on_change=None):
         Screen.__init__(self, session)
-        ConfigListScreen.__init__(self, [], session=session)
+        ConfigListScreen.__init__(self, [], session=session, on_change=on_change)
         self.skinName = "Setup"
         self["actions"] = ActionMap(["SetupActions", "ColorActions"],
             {

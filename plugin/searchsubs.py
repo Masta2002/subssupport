@@ -3,8 +3,6 @@ Created on Aug 2, 2014
 
 @author: marko
 '''
-from __future__ import absolute_import
-from __future__ import print_function
 
 import sys
 import json
@@ -53,13 +51,13 @@ def updateCB(*args):
     send(Messages.MESSAGE_UPDATE_CALLBACK, args)
 
 
-def chooseFileCB(*args):
-    send(Messages.MESSAGE_CHOOSE_FILE_CALLBACK, args)
+def chooseFileCB(subFiles):
+    send(Messages.MESSAGE_CHOOSE_FILE_CALLBACK, subFiles)
     return recieve()
 
 
-def overwriteFileCB(*args):
-    send(Messages.MESSAGE_OVERWRITE_CALLBACK, args)
+def overwriteFileCB(subFile):
+    send(Messages.MESSAGE_OVERWRITE_CALLBACK, subFile)
     return recieve()
 
 
