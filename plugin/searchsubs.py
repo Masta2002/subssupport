@@ -3,8 +3,6 @@ Created on Aug 2, 2014
 
 @author: marko
 '''
-from __future__ import absolute_import
-from __future__ import print_function
 
 import sys
 import json

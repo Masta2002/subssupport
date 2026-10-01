@@ -3,32 +3,43 @@ Created on Sep 16, 2014
 
 @author: marko
 '''
-from __future__ import absolute_import
-from __future__ import print_function
 import time
-from . import _
-from Components.ActionMap import HelpableActionMap
+
+from Components.ActionMap import ActionMap, HelpableActionMap
+from Components.ConfigList import ConfigListScreen
 from Components.Label import Label
-from Components.config import ConfigSubsection, getConfigListEntry
-from Components.config import config, ConfigOnOff
+from Components.MenuList import MenuList
+from Components.MultiContent import MultiContentEntryText
+from Components.Sources.StaticText import StaticText
+from Components.config import config, configfile, getConfigListEntry, ConfigNothing, ConfigOnOff, ConfigSubsection, ConfigText
 from Screens.HelpMenu import HelpableScreen
 from Screens.MessageBox import MessageBox
 from Screens.MinuteInput import MinuteInput
 from Screens.Screen import Screen
+from enigma import eTimer, eListboxPythonMultiContent, getDesktop, gFont, RT_HALIGN_LEFT
+from skin import parseColor
 
+from . import _
+from .compat import eConnectCallback
 from .e2_utils import getFps, fps_float, BaseMenuScreen, isFullHD, getDesktopSize
-from enigma import eTimer
 from .parsers.baseparser import ParseError
 from .process import LoadError, DecodeError, ParserNotFoundError
-from skin import parseColor
 from .subtitles import SubsChooser, initSubsSettings, SubsScreen, \
     SubsLoader, PARSERS, ALL_LANGUAGES_ENCODINGS, ENCODINGS, \
     warningMessage
 
-
 config.plugins.subsSupport = ConfigSubsection()
 config.plugins.subsSupport.dvb = ConfigSubsection()
 config.plugins.subsSupport.dvb.autoSync = ConfigOnOff(default=True)
+config.plugins.subsSupport.dvb.fpsDriftEnable = ConfigOnOff(default=False)
+
+config.plugins.subsSupport.dvb.fpsRatio_23_976 = ConfigText(default="1.0000", fixed_size=False)
+config.plugins.subsSupport.dvb.fpsRatio_24_000 = ConfigText(default="1.0000", fixed_size=False)
+config.plugins.subsSupport.dvb.fpsRatio_25_000 = ConfigText(default="1.0000", fixed_size=False)
+config.plugins.subsSupport.dvb.fpsRatio_29_970 = ConfigText(default="1.0000", fixed_size=False)
+config.plugins.subsSupport.dvb.fpsRatio_30_000 = ConfigText(default="1.0000", fixed_size=False)
+config.plugins.subsSupport.dvb.fpsRatio_50_000 = ConfigText(default="1.0000", fixed_size=False)
+config.plugins.subsSupport.dvb.fpsRatio_59_940 = ConfigText(default="1.0000", fixed_size=False)
 
 
 class SubsSetupDVBPlayer(BaseMenuScreen):
@@ -37,7 +48,60 @@ class SubsSetupDVBPlayer(BaseMenuScreen):
         self.dvbSettings = dvbSettings
 
     def buildMenu(self):
-        self['config'].setList([getConfigListEntry(_("Auto sync to current event"), self.dvbSettings.autoSync)])
+        lst = []
+        lst.append(getConfigListEntry(_("Auto sync to current event"), self.dvbSettings.autoSync))
+        lst.append(getConfigListEntry(" ", ConfigNothing()))
+
+        lst.append(getConfigListEntry(
+            _("Try to correct FPS drift with FPS ratio"),
+            config.plugins.subsSupport.dvb.fpsDriftEnable
+        ))
+
+        if config.plugins.subsSupport.dvb.fpsDriftEnable.value:
+            lst.append(getConfigListEntry(
+                _("Subtitles late: Decrease Ratio. Subtitles rush: Increase Ratio"),
+                ConfigNothing()
+            ))
+            lst.append(getConfigListEntry(_("Override Ratio for 23.976 (Standard is 1.0000)"),
+                                          config.plugins.subsSupport.dvb.fpsRatio_23_976))
+            lst.append(getConfigListEntry(_("Override Ratio for 24.000 (Standard is 1.0000)"),
+                                          config.plugins.subsSupport.dvb.fpsRatio_24_000))
+            lst.append(getConfigListEntry(_("Override Ratio for 25.000 (Standard is 1.0000)"),
+                                          config.plugins.subsSupport.dvb.fpsRatio_25_000))
+            lst.append(getConfigListEntry(_("Override Ratio for 29.970 (Standard is 1.0000)"),
+                                          config.plugins.subsSupport.dvb.fpsRatio_29_970))
+            lst.append(getConfigListEntry(_("Override Ratio for 30.000 (Standard is 1.0000)"),
+                                          config.plugins.subsSupport.dvb.fpsRatio_30_000))
+            lst.append(getConfigListEntry(_("Override Ratio for 50.000 (Standard is 1.0000)"),
+                                          config.plugins.subsSupport.dvb.fpsRatio_50_000))
+            lst.append(getConfigListEntry(_("Override Ratio for 59.940 (Standard is 1.0000)"),
+                                          config.plugins.subsSupport.dvb.fpsRatio_59_940))
+
+        self["config"].setList(lst)
+
+    def _rebuildIfToggle(self):
+        cur = self["config"].getCurrent()
+        if not cur:
+            return
+        cfg = cur[1]
+        if cfg is config.plugins.subsSupport.dvb.fpsDriftEnable:
+            self.buildMenu()
+
+    def keyLeft(self):
+        ConfigListScreen.keyLeft(self)
+        self._rebuildIfToggle()
+
+    def keyRight(self):
+        ConfigListScreen.keyRight(self)
+        self._rebuildIfToggle()
+
+    def keyOK(self):
+        # some images toggle booleans on OK
+        try:
+            ConfigListScreen.keyOK(self)
+        except Exception:
+            pass
+        self._rebuildIfToggle()
 
 
 class SubsSupportDVB(object):
@@ -73,42 +137,440 @@ class SubsSupportDVB(object):
                 self.subsScreen = self.session.instantiateDialog(SubsScreen, self.subsSettings.external)
                 subsEngine = SubsEngineDVB(self.session, self.subsSettings.engine, self.subsScreen)
                 subsEngine.setSubsList(subsList)
-                self.session.openWithCallback(self.subsControllerCB, SubsControllerDVB, subsEngine, config.plugins.subsSupport.dvb.autoSync.value)
+                self.session.openWithCallback(
+                    self.subsControllerCB,
+                    SubsControllerDVB,
+                    subsEngine,
+                    config.plugins.subsSupport.dvb.autoSync.value,
+                    False,
+                    None,
+                    self.subsSettings.external
+                )
         else:
             print('[SubsSupportDVB] no subtitles selected, exit')
 
     def subsControllerCB(self):
         self.session.deleteDialog(self.subsScreen)
 
+# UI revision v3: picker shows 10 complete rows; controller panel shifted down by 50px.
+
+
+class SubtitlePicker(Screen):
+    """
+    Responsive subtitle-line picker with aligned columns and fixed-height rows.
+
+    eListboxPythonMultiContent supports only one item height for the complete
+    list.  Using a different height for each subtitle row causes misaligned
+    columns and clipped entries, because the last processed row silently wins.
+    This screen therefore uses one resolution-aware row height and displays up
+    to two text lines per subtitle entry.
+    """
+
+    def __init__(self, session, subsList, currentIndex):
+        self.subsList = subsList or []
+        try:
+            self.currentIndex = int(currentIndex)
+        except Exception:
+            self.currentIndex = 0
+
+        self._configure_layout()
+        Screen.__init__(self, session)
+
+        self["actions"] = ActionMap(
+            ["OkCancelActions", "ColorActions", "SubtitlePickerActions"],
+            {
+                "ok": self.selectSubtitle,
+                "green": self.selectSubtitle,
+                "cancel": self.close,
+                "red": self.close,
+                "firstSubtitle": self.firstSubtitle,
+                "lastSubtitle": self.lastSubtitle,
+            },
+            -1
+        )
+
+        self["subList"] = MenuList(
+            [], enableWrapAround=True, content=eListboxPythonMultiContent
+        )
+        self["subList"].l.setItemHeight(self.row_height)
+        self["subList"].l.setFont(0, gFont("Regular", self.row_font_size))
+
+        self["key_red"] = StaticText(_("Cancel"))
+        self["key_green"] = StaticText(_("Select"))
+
+        self.updateSubtitleList()
+        self.onLayoutFinish.append(self.setInitialSelection)
+
+    def _configure_layout(self):
+        """Build a conservative picker layout for SD, HD and Full-HD skins."""
+        desktop = getDesktop(0).size()
+        desktop_width = desktop.width()
+        desktop_height = desktop.height()
+
+        if desktop_width >= 1920:
+            screen_width = min(1540, desktop_width - 120)
+            screen_height = min(900, desktop_height - 100)
+            self.row_height = 78
+            self.row_font_size = 26
+            header_font_size = 27
+            instruction_font_size = 24
+            footer_font_size = 26
+            header_height = 42
+            instruction_height = 38
+            footer_height = 48
+        elif desktop_width >= 1280:
+            screen_width = min(1120, desktop_width - 80)
+            screen_height = min(650, desktop_height - 60)
+            self.row_height = 68
+            self.row_font_size = 22
+            header_font_size = 23
+            instruction_font_size = 21
+            footer_font_size = 22
+            header_height = 38
+            instruction_height = 34
+            footer_height = 42
+        else:
+            screen_width = min(700, desktop_width - 20)
+            screen_height = min(540, desktop_height - 20)
+            self.row_height = 58
+            self.row_font_size = 18
+            header_font_size = 19
+            instruction_font_size = 17
+            footer_font_size = 18
+            header_height = 34
+            instruction_height = 30
+            footer_height = 38
+
+        # Always reserve enough vertical space for ten complete subtitle rows.
+        # On smaller screens, reduce row height proportionally so the picker
+        # remains fully visible while still displaying exactly ten items.
+        visible_rows = 10
+        padding = 10
+        instruction_y = 8
+        header_y = instruction_y + instruction_height + 4
+        list_y = header_y + header_height + 4
+        max_screen_height = max(1, desktop_height - 20)
+        fixed_height = list_y + 8 + footer_height + 8
+        max_row_height = max(1, int((max_screen_height - fixed_height) / visible_rows))
+        self.row_height = min(self.row_height, max_row_height)
+        self.row_font_size = max(14, min(self.row_font_size, int((self.row_height - 12) / 2)))
+        list_height = self.row_height * visible_rows
+        footer_y = list_y + list_height + 8
+        screen_height = footer_y + footer_height + 8
+        list_width = screen_width - (padding * 2)
+
+        self.number_width = max(64, int(list_width * 0.09))
+        self.time_width = max(170, int(list_width * 0.23))
+        self.subtitle_width = list_width - self.number_width - self.time_width
+
+        self.number_x = 0
+        self.time_x = self.number_width
+        self.subtitle_x = self.number_width + self.time_width
+
+        button_width = min(220, int((list_width - 12) / 2))
+        green_x = padding + button_width + 12
+
+        self.skin = """
+            <screen name="SubtitlePicker" position="center,center" size="%(screen_width)d,%(screen_height)d" title="Select Current Subtitle Line">
+                <eLabel position="%(padding)d,%(instruction_y)d" size="%(list_width)d,%(instruction_height)d" font="Regular;%(instruction_font_size)d" valign="center" halign="center" foregroundColor="#FFFFFF" backgroundColor="#303030" text="Press OK to select subtitle line" />
+                <eLabel position="%(padding)d,%(header_y)d" size="%(number_width)d,%(header_height)d" font="Regular;%(header_font_size)d" foregroundColor="#FFFFFF" backgroundColor="#202020" text="No." />
+                <eLabel position="%(time_header_x)d,%(header_y)d" size="%(time_width)d,%(header_height)d" font="Regular;%(header_font_size)d" foregroundColor="#FFFFFF" backgroundColor="#202020" text="Time" />
+                <eLabel position="%(subtitle_header_x)d,%(header_y)d" size="%(subtitle_width)d,%(header_height)d" font="Regular;%(header_font_size)d" foregroundColor="#FFFFFF" backgroundColor="#202020" text="Subtitle" />
+                <widget name="subList" position="%(padding)d,%(list_y)d" size="%(list_width)d,%(list_height)d" scrollbarMode="showOnDemand" />
+                <widget source="key_red" render="Label" position="%(padding)d,%(footer_y)d" size="%(button_width)d,%(footer_height)d" font="Regular;%(footer_font_size)d" valign="center" halign="center" foregroundColor="#FFFFFF" backgroundColor="#A00000" />
+                <widget source="key_green" render="Label" position="%(green_x)d,%(footer_y)d" size="%(button_width)d,%(footer_height)d" font="Regular;%(footer_font_size)d" valign="center" halign="center" foregroundColor="#FFFFFF" backgroundColor="#008000" />
+            </screen>
+        """ % {
+            "screen_width": screen_width,
+            "screen_height": screen_height,
+            "padding": padding,
+            "header_y": header_y,
+            "header_height": header_height,
+            "header_font_size": header_font_size,
+            "instruction_y": instruction_y,
+            "instruction_height": instruction_height,
+            "instruction_font_size": instruction_font_size,
+            "number_width": self.number_width,
+            "time_width": self.time_width,
+            "subtitle_width": self.subtitle_width,
+            "time_header_x": padding + self.time_x,
+            "subtitle_header_x": padding + self.subtitle_x,
+            "list_y": list_y,
+            "list_width": list_width,
+            "list_height": list_height,
+            "footer_y": footer_y,
+            "footer_height": footer_height,
+            "footer_font_size": footer_font_size,
+            "button_width": button_width,
+            "green_x": green_x,
+        }
+
+    def firstSubtitle(self):
+        """Jump to the first subtitle."""
+        if self.subsList:
+            self["subList"].moveToIndex(0)
+
+    def lastSubtitle(self):
+        """Jump to the final subtitle."""
+        if self.subsList:
+            self["subList"].moveToIndex(len(self.subsList) - 1)
+
+    def selectSubtitle(self):
+        """Return the highlighted subtitle index to the controller."""
+        index = self["subList"].getSelectedIndex()
+        if 0 <= index < len(self.subsList):
+            self.close(index)
+
+    def updateSubtitleList(self):
+        """Populate the picker with aligned fixed-height multi-content rows."""
+        menu_items = []
+        vertical_padding = 6
+        single_line_y = max(0, int((self.row_height - self.row_font_size) / 2))
+
+        for subtitle in self.subsList:
+            try:
+                caption_number = "%d" % (int(subtitle.get("index", 0)) + 1)
+            except Exception:
+                caption_number = "?"
+
+            timestamp = self.format_time(subtitle.get("start", 0))
+            subtitle_text = self.clean_display_text(subtitle.get("text") or "")
+            display_text = self._limit_display_lines(subtitle_text, max_lines=2)
+
+            row = [
+                subtitle,
+                MultiContentEntryText(
+                    pos=(self.number_x + 6, single_line_y),
+                    size=(self.number_width - 10, self.row_font_size + 6),
+                    font=0,
+                    text=caption_number,
+                    flags=RT_HALIGN_LEFT
+                ),
+                MultiContentEntryText(
+                    pos=(self.time_x + 6, single_line_y),
+                    size=(self.time_width - 10, self.row_font_size + 6),
+                    font=0,
+                    text=timestamp,
+                    flags=RT_HALIGN_LEFT
+                ),
+                MultiContentEntryText(
+                    pos=(self.subtitle_x + 6, vertical_padding),
+                    size=(self.subtitle_width - 12, self.row_height - (vertical_padding * 2)),
+                    font=0,
+                    text=display_text,
+                    flags=RT_HALIGN_LEFT
+                ),
+            ]
+            menu_items.append(row)
+
+        self["subList"].l.setItemHeight(self.row_height)
+        self["subList"].l.setList(menu_items)
+        self["subList"].l.invalidate()
+
+    def _limit_display_lines(self, text, max_lines=2):
+        """Keep picker rows uniform while preserving common two-line subtitles."""
+        lines = [line.strip() for line in text.replace("\r", "").split("\n") if line.strip()]
+        if not lines:
+            return ""
+        if len(lines) <= max_lines:
+            return "\n".join(lines)
+        visible = lines[:max_lines]
+        visible[-1] = visible[-1] + " ..."
+        return "\n".join(visible)
+
+    def clean_display_text(self, text):
+        """Remove RTL/LTR control characters that appear as picker artifacts."""
+        control_chars = (
+            "\u202B",  # RTL embedding
+            "\u202C",  # Pop directional formatting
+            "\u202A",  # LTR embedding
+            "\u202D",  # LTR override
+            "\u202E",  # RTL override
+            "\u200F",  # RTL mark
+            "\u200E",  # LTR mark
+        )
+        for char in control_chars:
+            text = text.replace(char, "")
+        return text.strip()
+
+    def setInitialSelection(self):
+        """Open the picker on the currently playing subtitle where possible."""
+        if not self.subsList:
+            return
+        index = min(max(self.currentIndex, 0), len(self.subsList) - 1)
+        self["subList"].moveToIndex(index)
+
+    def format_time(self, seconds):
+        """Convert a subtitle start time to hh:mm:ss,ms."""
+        try:
+            seconds = float(seconds)
+        except Exception:
+            seconds = 0.0
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millisecs = int(round((seconds - int(seconds)) * 1000))
+        if millisecs >= 1000:
+            secs += 1
+            millisecs = 0
+        return "%02d:%02d:%02d,%03d" % (hours, minutes, secs, millisecs)
+
+
+class DVBExternalStyleScreen(Screen, ConfigListScreen, HelpableScreen):
+    """
+    Live editor for config.plugins.subtitlesSupport.external (same items as initExternalSettings()).
+    Applies changes instantly to renderer.
+    """
+    skin = """
+    <screen position="center,center" size="900,522" title="External subtitles style (live)">
+        <widget name="config" position="10,10" size="880,450" scrollbarMode="showOnDemand" />
+        <eLabel position="10,470" size="880,2" backgroundColor="grey" />
+        <widget source="key_red" render="Label" position="10,480" size="280,30" font="Regular;24" />
+        <widget source="key_green" render="Label" position="310,480" size="280,30" font="Regular;24" />
+        <widget source="key_yellow" render="Label" position="610,480" size="280,30" font="Regular;24" />
+        <eLabel name="" position="10,512" size="280,8" backgroundColor="#f5516d" zPosition="3" />
+        <eLabel name="" position="310,512" size="280,8" backgroundColor="#92ef80" zPosition="3" />
+        <eLabel name="" position="610,512" size="280,8" backgroundColor="#ffd65c" zPosition="3" />
+    </screen>
+    """
+
+    def __init__(self, session, externalSettings, apply_cb):
+        Screen.__init__(self, session)
+        HelpableScreen.__init__(self)
+        self.externalSettings = externalSettings
+        self.apply_cb = apply_cb
+
+        self["key_red"] = StaticText(_("Cancel"))
+        self["key_green"] = StaticText(_("Save"))
+        self["key_yellow"] = StaticText(_("Apply now"))
+
+        ConfigListScreen.__init__(self, [], session=session)
+
+        self["actions"] = HelpableActionMap(self, "OkCancelActions",
+        {
+            "cancel": (self.keyCancel, _("cancel")),
+            "ok": (self.keyOk, _("ok")),
+        }, -1)
+
+        self["coloractions"] = HelpableActionMap(self, "ColorActions",
+        {
+            "red": (self.keyCancel, _("cancel")),
+            "green": (self.keySave, _("save")),
+            "yellow": (self.keyApply, _("apply now")),
+        }, -1)
+
+        self.onLayoutFinish.append(self.buildMenu)
+
+    def buildMenu(self):
+        # Reuse the same list builder already used in subtitles.py
+        from .subtitles import SubsSetupExternal
+        self["config"].setList(SubsSetupExternal.getConfigList(self.externalSettings))
+
+    def _apply_live(self):
+        if callable(self.apply_cb):
+            self.apply_cb()
+
+    def keyLeft(self):
+        ConfigListScreen.keyLeft(self)
+        cur = self["config"].getCurrent()
+        if cur and cur[1] in (
+            self.externalSettings.shadow.enabled,
+            self.externalSettings.shadow.type,
+            self.externalSettings.background.enabled,
+            self.externalSettings.background.type,
+            self.externalSettings.translate.mode,
+        ):
+            self.buildMenu()
+        self._apply_live()
+
+    def keyRight(self):
+        ConfigListScreen.keyRight(self)
+        cur = self["config"].getCurrent()
+        if cur and cur[1] in (
+            self.externalSettings.shadow.enabled,
+            self.externalSettings.shadow.type,
+            self.externalSettings.background.enabled,
+            self.externalSettings.background.type,
+            self.externalSettings.translate.mode,
+        ):
+            self.buildMenu()
+        self._apply_live()
+
+    def keyOk(self):
+        try:
+            ConfigListScreen.keyOK(self)
+        except Exception:
+            pass
+        self._apply_live()
+
+    def keyApply(self):
+        self._apply_live()
+
+    def keySave(self):
+        for x in self["config"].list:
+            x[1].save()
+        configfile.save()
+        self._apply_live()
+        self.close(True)
+
+    def keyCancel(self):
+        for x in self["config"].list:
+            x[1].cancel()
+        self.close(False)
+
 
 class SubsControllerDVB(Screen, HelpableScreen):
     fpsChoices = ["23.976", "23.980", "24.000", "25.000", "29.970", "30.000"]
 
-    def __init__(self, session, engine, autoSync=False, setSubtitlesFps=False, subtitlesFps=None):
+    def __init__(self, session, engine, autoSync=False, setSubtitlesFps=False, subtitlesFps=None, externalSettings=None):
         desktopSize = getDesktopSize()
-        windowPosition = (int(0.03 * desktopSize[0]), int(0.05 * desktopSize[1]))
+        controllerVerticalOffset = 50
+        windowPosition = (int(0.03 * desktopSize[0]), int(0.05 * desktopSize[1]) + controllerVerticalOffset)
         windowSize = (int(0.9 * desktopSize[0]), int(0.4 * desktopSize[1]))
         fontSize = 33 if isFullHD() else 22
-        leftWidget = (int(0.4 * windowSize[0]), fontSize + 10, fontSize)
-        rightWidget = (int(0.4 * windowSize[0]), fontSize + 10, fontSize)
-        xpos = (int(0.6 * windowSize[0]), )
+        rowHeight = fontSize + 10
+        rowStep = rowHeight + 10
+        if isFullHD():
+            instructionFontSize = 24
+        elif desktopSize[0] >= 1280:
+            instructionFontSize = 18
+        else:
+            instructionFontSize = 14
+        instructionHeight = instructionFontSize + 10
+        contentY = instructionHeight + 8
+        leftWidth = int(0.4 * windowSize[0])
+        rightX = int(0.6 * windowSize[0])
+        rightWidth = int(0.4 * windowSize[0])
         self.skin = """
-            <screen position="%d,%d" size="%d,%d" zPosition="2" backgroundColor="transparent" flags="wfNoBorder">
-                <widget name="subtitle" position="0,0" size="%d,%d" valign="center" halign="left" font="Regular;%d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
-                <widget name="subtitlesTime" position="0,%d" size="%d,%d" valign="center" halign="left" font="Regular;%d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
-                <widget name="subtitlesPosition" position="0,%d" size="%d,%d" valign="center" halign="left" font="Regular;%d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
-                <widget name="subtitlesFps" position="0,%d" size="%d,%d" valign="center" halign="left" font="Regular;%d" transparent="1" foregroundColor="#6F9EF5" shadowColor="#40101010" shadowOffset="2,2" />
-                <widget name="eventName" position="%d,%d" size="%d,%d" valign="center" halign="left" font="Regular;%d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
-                <widget name="eventTime" position="%d,%d" size="%d,%d" valign="center" halign="left" font="Regular;%d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
-                <widget name="eventDuration" position="%d,%d" size="%d,%d" valign="center" halign="left" font="Regular;%d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
-            </screen>""" % (windowPosition + windowSize +
-                leftWidget +
-                (leftWidget[1] + 10,) + leftWidget +
-                ((leftWidget[1] + 10) * 2,) + leftWidget +
-                ((leftWidget[1] + 10) * 3,) + leftWidget +
-                xpos + (0,) + rightWidget +
-                xpos + ((rightWidget[1] + 10) * 1,) + rightWidget +
-                xpos + ((rightWidget[1] + 10) * 2,) + rightWidget)
+            <screen position="%(window_x)d,%(window_y)d" size="%(window_width)d,%(window_height)d" zPosition="2" backgroundColor="transparent" flags="wfNoBorder">
+                <widget name="instruction" position="0,0" size="%(window_width)d,%(instruction_height)d" valign="center" halign="center" font="Regular;%(instruction_font_size)d" transparent="1" foregroundColor="#F7A900" shadowColor="#40101010" shadowOffset="2,2" />
+                <widget name="subtitle" position="0,%(left_row_0)d" size="%(left_width)d,%(row_height)d" valign="center" halign="left" font="Regular;%(font_size)d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
+                <widget name="subtitlesTime" position="0,%(left_row_1)d" size="%(left_width)d,%(row_height)d" valign="center" halign="left" font="Regular;%(font_size)d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
+                <widget name="subtitlesPosition" position="0,%(left_row_2)d" size="%(left_width)d,%(row_height)d" valign="center" halign="left" font="Regular;%(font_size)d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
+                <widget name="subtitlesFps" position="0,%(left_row_3)d" size="%(left_width)d,%(row_height)d" valign="center" halign="left" font="Regular;%(font_size)d" transparent="1" foregroundColor="#6F9EF5" shadowColor="#40101010" shadowOffset="2,2" />
+                <widget name="eventName" position="%(right_x)d,%(right_row_0)d" size="%(right_width)d,%(row_height)d" valign="center" halign="left" font="Regular;%(font_size)d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
+                <widget name="eventTime" position="%(right_x)d,%(right_row_1)d" size="%(right_width)d,%(row_height)d" valign="center" halign="left" font="Regular;%(font_size)d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
+                <widget name="eventDuration" position="%(right_x)d,%(right_row_2)d" size="%(right_width)d,%(row_height)d" valign="center" halign="left" font="Regular;%(font_size)d" transparent="1" foregroundColor="#ffffff" shadowColor="#40101010" shadowOffset="2,2" />
+            </screen>""" % {
+                "window_x": windowPosition[0],
+                "window_y": windowPosition[1],
+                "window_width": windowSize[0],
+                "window_height": windowSize[1],
+                "instruction_height": instructionHeight,
+                "instruction_font_size": instructionFontSize,
+                "font_size": fontSize,
+                "left_width": leftWidth,
+                "row_height": rowHeight,
+                "left_row_0": contentY,
+                "left_row_1": contentY + rowStep,
+                "left_row_2": contentY + (rowStep * 2),
+                "left_row_3": contentY + (rowStep * 3),
+                "right_x": rightX,
+                "right_width": rightWidth,
+                "right_row_0": contentY,
+                "right_row_1": contentY + rowStep,
+                "right_row_2": contentY + (rowStep * 2),
+            }
 
         Screen.__init__(self, session)
         HelpableScreen.__init__(self)
@@ -121,6 +583,7 @@ class SubsControllerDVB(Screen, HelpableScreen):
             self.providedSubtitlesFps = subtitlesFps
         else:
             self.providedSubtitlesFps = None
+        self.externalSettings = externalSettings
         self.hideTimer = eTimer()
         self.hideTimer_conn = eConnectCallback(self.hideTimer.timeout, self.hideStatus)
         self.hideTimerDelay = 5000
@@ -132,6 +595,7 @@ class SubsControllerDVB(Screen, HelpableScreen):
         self._baseTime = 0
         self._accTime = 0
         self.statusLocked = False
+        self["instruction"] = Label(_("Press RED to open subtitle picker - Press OK to hide/unhide - Press MENU to open Subtitle display - Press INFO to open help screen"))
         self['subtitle'] = Label()
         self['subtitlesPosition'] = Label(_("Subtitles Position") + ":")
         self['subtitlesTime'] = Label(_("Subtitles Time") + ":")
@@ -155,7 +619,12 @@ class SubsControllerDVB(Screen, HelpableScreen):
             "prevSubManual": (self.previousManual, _("skip previous subtitle by setting time in minutes")),
             "eventSync": (self.eventSync, _("skip subtitle to current event position")),
             "changeFps": (self.changeFps, _("change subtitles fps")),
-        }, 0)
+            "openSubtitlePicker": (self.openSubtitlePicker, _("open Subtitle Picker")),
+            "showHelp": (self.showHelp, _("show help")),
+            "confirmClose": (self.confirmClose, _("exit (confirm)")),
+            "externalStyle": (self.externalStyle, _("External style")),
+        }, -1)
+
         try:
             from Screens.InfoBar import InfoBar
             InfoBar.instance.subtitle_window.hide()
@@ -172,6 +641,79 @@ class SubsControllerDVB(Screen, HelpableScreen):
             self.onFirstExecBegin.append(self.eventSync)
         self.onClose.append(self.engine.close)
         self.onClose.append(self.delTimers)
+
+    def applyExternalStyleNow(self):
+        r = self.engine.renderer
+        try:
+            r.hideSubtitle()
+        except Exception:
+            pass
+        if hasattr(r, "reloadSettings"):
+            r.reloadSettings()
+        self.engine.renderSub()
+
+    def externalStyle(self):
+        if self.externalSettings is None:
+            self.session.open(MessageBox, _("External settings not provided!"), MessageBox.TYPE_ERROR, timeout=3)
+            return
+        self.session.open(
+            DVBExternalStyleScreen,
+            self.externalSettings,
+            self.applyExternalStyleNow
+    )
+
+    def confirmClose(self):
+        def cb(answer):
+            if answer:
+                self.close()
+
+        self.session.openWithCallback(
+            cb,
+            MessageBox,
+            _("Exit SubsSupport DVB player?"),
+            MessageBox.TYPE_YESNO
+        )
+
+    def showHelp(self):
+        txt = "\n".join([
+            _("Controls:"),
+            "",
+            _("RED: Open Subtitle Picker"),
+            _("YELLOW: Sync subtitle to current event"),
+            _("BLUE: Change subtitles FPS"),
+            _("OK: Show/Hide status panel"),
+            _("LEFT: Previous subtitle"),
+            _("RIGHT: Next subtitle"),
+            _("UP/DOWN: Restart current subtitle"),
+            _("PREV/REWIND (short): -1 minute"),
+            _("NEXT/FF (short): +1 minute"),
+            _("PREV (long): Manual -minutes jump"),
+            _("NEXT (long): Manual +minutes jump"),
+            _("EXIT: Exit (confirm)"),
+            _("MENU: Show subtitle Style Settings"),
+            _("INFO: Show this help"),
+        ])
+        self.session.open(MessageBox, txt, MessageBox.TYPE_INFO, timeout=20)
+
+    def openSubtitlePicker(self):
+        try:
+            subtitleList = self.engine.getSubtitlesList()
+            currentIndex = self.engine.getPosition()
+
+            if not subtitleList:
+                print("[ERROR] No subtitles available to open SubtitlePicker")
+                return
+            self.session.openWithCallback(self.onSubtitlePicked, SubtitlePicker, subtitleList, currentIndex)
+        except Exception as e:
+            print(f"[ERROR] Failed to open SubtitlePicker: {e}")
+
+    def onSubtitlePicked(self, index=None):
+        if index is not None:
+            self.engine.setPosition(index)
+            self.engine.renderSub()  # Ensure the new subtitle is displayed immediately
+            self.engine.setRefTime()  # Reset timing to allow automatic progression
+            self.engine.startHideTimer()  # Restart timer for next subtitle
+            self.showStatus(True)  # Refresh UI
 
     def startEventTimer(self):
         self.eventTimer.start(500)
@@ -213,6 +755,7 @@ class SubsControllerDVB(Screen, HelpableScreen):
         self.updateSubtitlesFps()
         self.updateSubtitlesPosition()
         self.updateEventStatus()
+        self['instruction'].visible = True
         self['subtitle'].visible = True
         self['subtitlesPosition'].visible = True
         self['subtitlesTime'].visible = True
@@ -224,6 +767,7 @@ class SubsControllerDVB(Screen, HelpableScreen):
             self.hideTimer.start(self.hideTimerDelay, True)
 
     def hideStatus(self):
+        self['instruction'].visible = False
         self['subtitle'].visible = False
         self['subtitlesPosition'].visible = False
         self['subtitlesTime'].visible = False
@@ -446,7 +990,10 @@ class SubsEngineDVB(object):
         else:
             self.waitTimer.stop()
             self.hideTimer.stop()
-            self.fpsRatio = subsFps / float(videoFps)
+            base = subsFps / float(videoFps)
+            override = self.getFpsDriftOverride()
+            self.fpsRatio = base * override
+            self.setRefTime()                 # <‑‑ keeps timing coherent
             self.renderSub()
             if not self.paused:
                 self.setRefTime()
@@ -472,6 +1019,48 @@ class SubsEngineDVB(object):
 
     def getCurrentSub(self):
         return self.subsList[self.position]
+
+    def _safeRatio(self, cfg, default=1.0):
+        try:
+            s = str(cfg.value).strip().replace(",", ".")
+            v = float(s)
+            # optional clamp to avoid insane values
+            if v < 0.80 or v > 1.20:
+                return default
+            return v
+        except:
+            return default
+
+    def getSubtitlesList(self):
+        """Subtitle lines with start/end in seconds, for the line picker."""
+        result = []
+        for idx, sub in enumerate(self.subsList):
+            text = "\n".join(row["text"] for row in sub["rows"]) if "rows" in sub else sub.get("text", "")
+            result.append({"index": idx, "text": text, "start": sub["start"] / 90000, "end": sub["end"] / 90000})
+        return result
+
+    def getFpsDriftOverride(self):
+        if not config.plugins.subsSupport.dvb.fpsDriftEnable.value:
+            return 1.0
+
+        videoFps = getFps(self.session, True)
+        if videoFps is None:
+            return 1.0
+
+        vf = "%.3f" % float(videoFps)
+
+        m = {
+            "23.976": config.plugins.subsSupport.dvb.fpsRatio_23_976,
+            "24.000": config.plugins.subsSupport.dvb.fpsRatio_24_000,
+            "25.000": config.plugins.subsSupport.dvb.fpsRatio_25_000,
+            "29.970": config.plugins.subsSupport.dvb.fpsRatio_29_970,
+            "30.000": config.plugins.subsSupport.dvb.fpsRatio_30_000,
+            "50.000": config.plugins.subsSupport.dvb.fpsRatio_50_000,
+            "59.940": config.plugins.subsSupport.dvb.fpsRatio_59_940,
+        }
+
+        cfg = m.get(vf)
+        return self._safeRatio(cfg, 1.0) if cfg else 1.0
 
     def setRefTime(self):
         self.reftime = time.time() * 1000
