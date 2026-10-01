@@ -165,6 +165,24 @@ class YtssubsSeeker(XBMCSubtitlesAdapter):
 
 
 try:
+    from .Justsubtitles import justsubtitles
+except ImportError as e:
+    justsubtitles = e
+
+
+class JustsubtitlesSeeker(XBMCSubtitlesAdapter):
+    id = 'justsubtitles'
+    module = justsubtitles
+    if isinstance(module, Exception):
+        error, module = module, None
+    provider_name = 'JustSubtitles'
+    supported_langs = ['en', 'ar', 'de', 'it', 'id', 'ja', 'ko']
+    default_settings = {}
+    movie_search = True
+    tvshow_search = False
+
+
+try:
     from .LocalDrive import localdrive
 except ImportError as e:
     localdrive = e

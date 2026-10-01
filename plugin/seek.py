@@ -29,7 +29,7 @@ try:
     from .seekers import SubtitlesDownloadError, SubtitlesSearchError, \
         SubtitlesErrors, SubtitlesmoraSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
         Subf2mSeeker, LocalDriveSeeker, IndexsubtitleSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
-        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, WyzieSeeker
+        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, JustsubtitlesSeeker, WyzieSeeker
     from .seekers.seeker import BaseSeeker
     from .seekers.utilities import languageTranslate, langToCountry, \
         getCompressedFileType, detectSearchParams
@@ -38,7 +38,7 @@ except (ValueError, ImportError):  # searchsubs.py runs seek.py as a top-level m
     from seekers import SubtitlesDownloadError, SubtitlesSearchError, \
         SubtitlesErrors, SubtitlesmoraSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
         Subf2mSeeker, LocalDriveSeeker, IndexsubtitleSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
-        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, WyzieSeeker
+        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, JustsubtitlesSeeker, WyzieSeeker
     from seekers.seeker import BaseSeeker
     from seekers.utilities import languageTranslate, langToCountry, \
         getCompressedFileType, detectSearchParams
@@ -53,6 +53,7 @@ SUBTITLES_SEEKERS.append(OpenSubtitles2Seeker)
 SUBTITLES_SEEKERS.append(WyzieSeeker)
 SUBTITLES_SEEKERS.append(SubtitlesmoraSeeker)
 SUBTITLES_SEEKERS.append(YtssubsSeeker)
+SUBTITLES_SEEKERS.append(JustsubtitlesSeeker)
 SUBTITLES_SEEKERS.append(IndexsubtitleSeeker)
 SUBTITLES_SEEKERS.append(MoviesubtitlesSeeker)
 SUBTITLES_SEEKERS.append(SubtitlecatSeeker)

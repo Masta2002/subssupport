@@ -25,6 +25,7 @@ plugin/seekers/Subtitlesmora/Makefile
 plugin/seekers/Titlovi/Makefile
 plugin/seekers/Titulky/Makefile
 plugin/seekers/Ytssubs/Makefile
+plugin/seekers/Justsubtitles/Makefile
 plugin/seekers/Wyzie/Makefile
 plugin/parsers/Makefile
 plugin/img/Makefile
