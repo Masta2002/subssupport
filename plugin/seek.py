@@ -16,7 +16,6 @@
 #
 #################################################################################
 
-from __future__ import absolute_import
 import os
 from re import sub
 import shutil
@@ -28,18 +27,18 @@ import zipfile
 
 try:
     from .seekers import SubtitlesDownloadError, SubtitlesSearchError, \
-        SubtitlesErrors, SubtitlesmoraSeeker, NovalermoraSeeker, ElsubtitleSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
-        OpenSubtitlesMoraSeeker, PodnapisiSeeker, SubscenebestSeeker, LocalDriveSeeker, IndexsubtitleSeeker, SubsytsSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
-         TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, FoursubSeeker, YtssubsSeeker
+        SubtitlesErrors, SubtitlesmoraSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
+        Subf2mSeeker, LocalDriveSeeker, IndexsubtitleSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
+        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, JustsubtitlesSeeker, WyzieSeeker
     from .seekers.seeker import BaseSeeker
     from .seekers.utilities import languageTranslate, langToCountry, \
         getCompressedFileType, detectSearchParams
     from .utils import SimpleLogger
-except (ValueError, ImportError):
+except (ValueError, ImportError):  # searchsubs.py runs seek.py as a top-level module in its own process
     from seekers import SubtitlesDownloadError, SubtitlesSearchError, \
-        SubtitlesErrors, SubtitlesmoraSeeker, NovalermoraSeeker, ElsubtitleSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
-        OpenSubtitlesMoraSeeker, PodnapisiSeeker, SubscenebestSeeker, LocalDriveSeeker, IndexsubtitleSeeker, SubsytsSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
-         TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, FoursubSeeker, YtssubsSeeker
+        SubtitlesErrors, SubtitlesmoraSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
+        Subf2mSeeker, LocalDriveSeeker, IndexsubtitleSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
+        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, JustsubtitlesSeeker, WyzieSeeker
     from seekers.seeker import BaseSeeker
     from seekers.utilities import languageTranslate, langToCountry, \
         getCompressedFileType, detectSearchParams
@@ -51,21 +50,17 @@ SUBTITLES_SEEKERS.append(LocalDriveSeeker)
 SUBTITLES_SEEKERS.append(SubsourceSeeker)
 SUBTITLES_SEEKERS.append(SubdlSeeker)
 SUBTITLES_SEEKERS.append(OpenSubtitles2Seeker)
+SUBTITLES_SEEKERS.append(WyzieSeeker)
 SUBTITLES_SEEKERS.append(SubtitlesmoraSeeker)
-SUBTITLES_SEEKERS.append(NovalermoraSeeker)
-SUBTITLES_SEEKERS.append(FoursubSeeker)
 SUBTITLES_SEEKERS.append(YtssubsSeeker)
-SUBTITLES_SEEKERS.append(SubsytsSeeker)
+SUBTITLES_SEEKERS.append(JustsubtitlesSeeker)
 SUBTITLES_SEEKERS.append(IndexsubtitleSeeker)
 SUBTITLES_SEEKERS.append(MoviesubtitlesSeeker)
 SUBTITLES_SEEKERS.append(SubtitlecatSeeker)
-SUBTITLES_SEEKERS.append(ElsubtitleSeeker)
 SUBTITLES_SEEKERS.append(Sub_Scene_comSeeker)
-SUBTITLES_SEEKERS.append(SubscenebestSeeker)
-SUBTITLES_SEEKERS.append(OpenSubtitlesMoraSeeker)
+SUBTITLES_SEEKERS.append(Subf2mSeeker)
 SUBTITLES_SEEKERS.append(MySubsSeeker)
 SUBTITLES_SEEKERS.append(TitulkyComSeeker)
-SUBTITLES_SEEKERS.append(PodnapisiSeeker)
 SUBTITLES_SEEKERS.append(TitloviSeeker)
 SUBTITLES_SEEKERS.append(PrijevodiOnlineSeeker)
 
@@ -153,7 +148,7 @@ class SubsSeeker(object):
                 else:
                     threads.append(threading.Thread(target=self._searchSubtitles, args=(lock, subtitlesDict, updateCB, provider, title, filepath, langs, season, episode, tvshow, year)))
             for t in threads:
-                t.setDaemon(True)
+                t.daemon = True
                 t.start()
             working = True
             while working:
@@ -183,11 +178,11 @@ class SubsSeeker(object):
                     if 'country' not in sub:
                         sub['country'] = langToCountry(languageTranslate(sub['language_name'], 0, 2))
         if synced:
-            subtitles_list = filter(lambda x: x['sync'], subtitles_list)
+            subtitles_list = [x for x in subtitles_list if x['sync']]
         elif nonsynced:
-            subtitles_list = filter(lambda x: not x['sync'], subtitles_list)
+            subtitles_list = [x for x in subtitles_list if not x['sync']]
         if langs:
-            subtitles_list = filter(lambda x: x['language_name'] in [languageTranslate(lang, 0, 2) for lang in langs])
+            subtitles_list = [x for x in subtitles_list if languageTranslate(x['language_name'], 0, 2) in langs]
         return subtitles_list
 
     def sortSubtitlesList(self, subtitles_list, langs=None, sort_langs=False, sort_rank=False, sort_sync=False, sort_provider=False):
