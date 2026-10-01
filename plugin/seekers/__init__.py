@@ -3,7 +3,6 @@ Created on Feb 10, 2014
 
 @author: marko
 '''
-from __future__ import absolute_import
 try:
     from . import _
 except ImportError:
@@ -12,5 +11,5 @@ except ImportError:
 
 from .seeker import SubtitlesDownloadError, SubtitlesSearchError, SubtitlesErrors
 from .xbmc_subtitles import TitulkyComSeeker, \
-    OpenSubtitles2Seeker, SubdlSeeker, SubsytsSeeker, SubtitlecatSeeker, MoviesubtitlesSeeker, IndexsubtitleSeeker, YtssubsSeeker, FoursubSeeker, PodnapisiSeeker, Subf2mSeeker, LocalDriveSeeker, Sub_Scene_comSeeker, SubtitlesmoraSeeker, \
-     TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, NovalermoraSeeker, ElsubtitleSeeker
+    OpenSubtitles2Seeker, SubdlSeeker, SubtitlecatSeeker, MoviesubtitlesSeeker, IndexsubtitleSeeker, YtssubsSeeker, Subf2mSeeker, LocalDriveSeeker, Sub_Scene_comSeeker, SubtitlesmoraSeeker, \
+     TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, WyzieSeeker

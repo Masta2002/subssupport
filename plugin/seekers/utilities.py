@@ -265,28 +265,17 @@ def hashFile(file_path, rar):
         return OpensubtitlesHashRar(file_path)
 
     log(__name__, "Hash Standard file")
-    longlongformat = 'q'  # long long
-    bytesize = struct.calcsize(longlongformat)
-    f = open(file_path, 'r')
-
-    filesize = getFileSize(file_path)
-    hash = filesize
-
+    filesize = os.path.getsize(file_path)
     if filesize < 65536 * 2:
-        return "SizeError"
-
-    buffer = f.read(65536)
-    f.seek(max(0, filesize - 65536), 0)
-    buffer += f.read(65536)
-    f.close()
-    for x in range((65536 / bytesize) * 2):
-        size = x * bytesize
-        (l_value,) = struct.unpack(longlongformat, buffer[size:size + bytesize])
-        hash += l_value
-        hash = hash & 0xFFFFFFFFFFFFFFFF
-
-    returnHash = "%016x" % hash
-    return filesize, returnHash
+        raise ValueError("file too small for hashing")
+    with open(file_path, 'rb') as f:
+        buffer = f.read(65536)
+        f.seek(filesize - 65536, 0)
+        buffer += f.read(65536)
+    hash = filesize
+    for (l_value,) in struct.iter_unpack('<q', buffer):
+        hash = (hash + l_value) & 0xFFFFFFFFFFFFFFFF
+    return filesize, "%016x" % hash
 
 
 def normalizeString(str):
@@ -297,9 +286,9 @@ def normalizeString(str):
 
 def OpensubtitlesHashRar(firsrarfile):
     log(__name__, "Hash Rar file")
-    f = open(firsrarfile, 'r')
+    f = open(firsrarfile, 'rb')
     a = f.read(4)
-    if a != 'Rar!':
+    if a != b'Rar!':
         raise Exception('ERROR: This is not rar file.')
     seek = 0
     for i in list(range(4)):
@@ -314,7 +303,7 @@ def OpensubtitlesHashRar(firsrarfile):
             if (flag & 0x0100):
                 s_unpacksize = (struct.unpack('<I', a[36:36 + 4])[0] << 32) + s_unpacksize
                 log(__name__, 'Hash untested for files biger that 2gb. May work or may generate bad hash.')
-            lastrarfile = getlastsplit(firsrarfile, (s_unpacksize - 1) / s_partiizebody)
+            lastrarfile = getlastsplit(firsrarfile, (s_unpacksize - 1) // s_partiizebody)
             hash = addfilehash(firsrarfile, s_unpacksize, s_partiizebodystart)
             hash = addfilehash(lastrarfile, hash, (s_unpacksize % s_partiizebody) + s_partiizebodystart - 65536)
             f.close()
@@ -334,7 +323,7 @@ def getlastsplit(firsrarfile, x):
 
 
 def addfilehash(name, hash, seek):
-    f = open(name, 'r')
+    f = open(name, 'rb')
     f.seek(max(0, seek), 0)
     for i in range(8192):
         hash += struct.unpack('<q', f.read(8))[0]
@@ -345,16 +334,37 @@ def addfilehash(name, hash, seek):
 
 def hashFileMD5(file_path, buff_size=1048576):
     # calculate MD5 key from file
-    f = open(file_path, 'r')
-    if f.size() < buff_size:
+    if os.path.getsize(file_path) < buff_size:
         return None
-    f.seek(0, 0)
-    buff = f.read(buff_size)    # size=1M
-    f.close()
+    with open(file_path, 'rb') as f:
+        buff = f.read(buff_size)    # size=1M
     # calculate MD5 key from file
     m = md5()
     m.update(buff)
     return m.hexdigest()
+
+
+def imdbLookup(title, year=None, tvshow=False):
+    """Returns the IMDb id (tt...) for a title via the keyless IMDb suggestion API, or None."""
+    import requests
+    from urllib.parse import quote
+    from .user_agents import get_random_ua
+    query = re.sub(r"\s*\(\d{4}\)$", "", title or "").strip()
+    if not query:
+        return None
+    url = "https://v3.sg.media-imdb.com/suggestion/x/%s.json" % quote(query.lower())
+    try:
+        items = requests.get(url, headers={"User-Agent": get_random_ua()}, timeout=10).json().get("d") or []
+    except Exception as e:
+        log(__name__, "imdb lookup failed: %s" % e)
+        return None
+    kinds = ("tvSeries", "tvMiniSeries") if tvshow else ("movie", "tvMovie", "video")
+    items = [i for i in items if i.get("id", "").startswith("tt") and i.get("qid") in kinds]
+    if year:
+        items = [i for i in items if str(i.get("y")) == str(year)] or items
+    exact = [i for i in items if i.get("l", "").lower() == query.lower()]
+    items = exact or items
+    return items[0]["id"] if items else None
 
 
 def langToCountry(lang):
@@ -442,21 +452,21 @@ class SimpleLogger(object):
 
     def error(self, text, *args):
         if self.log_level >= self.LOG_ERROR:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[error] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def info(self, text, *args):
         if self.log_level >= self.LOG_INFO:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[info] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def debug(self, text, *args):
         if self.log_level == self.LOG_DEBUG:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[debug] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)

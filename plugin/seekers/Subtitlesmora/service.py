@@ -1,163 +1,112 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
+"""Arabic subtitles from the archive.org item "mora25r" (one .srt per movie, a few episodes).
+
+The file list is read from the archive.org metadata API and cached for 24 hours;
+titles are matched with Roman numeral variations (Rocky II <-> Rocky 2).
+"""
+import json
 import os
 import re
+import tempfile
+import time
+from urllib.parse import quote
+
 import requests
-from urllib.parse import quote_plus, unquote
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-from ..utilities import languageTranslate, log, getFileSize
-from ..seeker import SubtitlesDownloadError, SubtitlesErrors
 
-# Suppress insecure request warnings
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+from ..user_agents import get_random_ua
+from ..utilities import log
 
-# Constants
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; rv:109.0) Gecko/20100101 Firefox/115.0',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'fr,fr-FR;q=0.8,en-US;q=0.5,en;q=0.3',
-    'Content-Type': 'text/html; charset=UTF-8',
-    'Host': 'archive.org',
-    'Referer': 'https://archive.org',
-    'Upgrade-Insecure-Requests': '1',
-    'Connection': 'keep-alive',
-    'Accept-Encoding': 'gzip, deflate'
-}
+ITEM = "mora25r"
+METADATA_URL = "https://archive.org/metadata/%s" % ITEM
+DOWNLOAD_URL = "https://archive.org/download/%s/" % ITEM
+LANGUAGE = "Arabic"
+SUB_EXTS = ('.srt', '.ass', '.ssa', '.sub')
+CACHE_DIR = "/var/volatile/tmp" if os.path.isdir("/var/volatile/tmp") else tempfile.gettempdir()
+CACHE_FILE = os.path.join(CACHE_DIR, "subssupport_archive_%s.json" % ITEM)
+CACHE_TIMEOUT = 24 * 3600
 
-SESSION = requests.Session()
-MAIN_URL = "https://archive.org"
-DEBUG_PRETEXT = "archive.org"
+ROMAN = (('xx', 20), ('xix', 19), ('xviii', 18), ('xvii', 17), ('xvi', 16), ('xv', 15), ('xiv', 14), ('xiii', 13),
+         ('xii', 12), ('xi', 11), ('x', 10), ('ix', 9), ('viii', 8), ('vii', 7), ('vi', 6), ('v', 5), ('iv', 4),
+         ('iii', 3), ('ii', 2))
+ROMAN_TO_INT = dict((r, str(n)) for r, n in ROMAN)
+INT_TO_ROMAN = dict((str(n), r) for r, n in ROMAN)
 
 
-def get_url(url, referer=None):
-    headers = {'User-Agent': HEADERS['User-Agent']}
-    if referer:
-        headers['Referer'] = referer
-
-    response = SESSION.get(url, headers=headers, verify=False)
-    return response.text.replace('\n', '')
+def normalize(text):
+    """'The Matrix: Reloaded' -> 'the.matrix.reloaded'"""
+    text = re.sub(r"['`]", '', text.lower()).replace('&', 'and')
+    return '.'.join(re.findall(r'[^\W_]+', text))
 
 
-def get_rating(downloads):
-    return min(10, max(1, downloads // 50 + 1))
+def title_variations(title):
+    """Title with Roman numerals as digits and vice versa ('rocky.ii' -> 'rocky.2'), 'I' is left alone."""
+    words = normalize(title).split('.')
+    variations = ['.'.join(words)]
+    for table in (ROMAN_TO_INT, INT_TO_ROMAN):
+        variant = '.'.join(table.get(w, w) for w in words)
+        if variant not in variations:
+            variations.append(variant)
+    return variations
 
 
-def search_subtitles(file_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
-    subtitles_list = []
-    msg = ""
+def read_cache():
+    try:
+        with open(CACHE_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
-    # Check if title is blank or empty
-    if not title or title.strip() == "":
-        log(__name__, f"{DEBUG_PRETEXT} Title is blank, skipping search")
-        return subtitles_list, "", msg
 
-    title = re.sub(r' ▎', '▎', title)
+def get_file_list():
+    try:
+        fresh = time.time() - os.path.getmtime(CACHE_FILE) < CACHE_TIMEOUT
+    except OSError:
+        fresh = False
+    names = read_cache() if fresh else None
+    if names is not None:
+        return names
+    try:
+        r = requests.get(METADATA_URL, headers={'User-Agent': get_random_ua()}, timeout=15)
+        r.raise_for_status()
+        names = [f['name'] for f in r.json().get('files', []) if f.get('name', '').lower().endswith(SUB_EXTS)]
+    except (requests.RequestException, ValueError) as e:
+        log(__name__, "metadata request failed: %s" % e)
+        return read_cache() or []  # an outdated list is better than none
+    try:
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(names, f)
+    except OSError as e:
+        log(__name__, "cannot write cache %s: %s" % (CACHE_FILE, e))
+    return names
 
-    # Define bad strings to remove
-    bad_strings = [
-                "ae|", "al|", "ar|", "at|", "ba|", "be|", "bg|", "br|", "cg|", "ch|", "cz|", "da|", "de|", "dk|",
-                "ee|", "en|", "es|", "eu|", "ex-yu|", "fi|", "fr|", "gr|", "hr|", "hu|", "in|", "ir|", "it|", "lt|",
-                "mk|", "mx|", "nl|", "no|", "pl|", "pt|", "ro|", "rs|", "ru|", "se|", "si|", "sk|", "sp|", "tr|",
-                "uk|", "us|", "yu|", "ae▎", "al▎", "ar▎", "at▎", "ba▎", "be▎", "bg▎", "br▎", "cg▎", "ch▎", "cz▎", "da▎", "de▎", "dk▎",
-                "ee▎", "en▎", "es▎", "eu▎", "ex-yu▎", "fi▎", "fr▎", "gr▎", "hr▎", "hu▎", "in▎", "ir▎", "it▎", "lt▎",
-                "mk▎", "mx▎", "nl▎", "no▎", "pl▎", "pt▎", "ro▎", "rs▎", "ru▎", "se▎", "si▎", "sk▎", "sp▎", "tr▎",
-                "uk▎", "us▎", "yu▎"
-                "1080p", "4k", "720p", "hdrip", "hindi", "imdb", "vod", "x264"
-            ]
 
-    # Remove bad strings from title
-    for bad in bad_strings:
-        title = title.replace(bad, "")
-
-    # Clean up remaining special characters and spaces
-    title = re.sub(r'[:,"&!?\-]', '', title).replace("  ", " ").strip()  # .title()
-    title = re.sub(r"'", '', title)
-
-    print(f"Cleaned title: {title}")  # Debug print
-
-    if tvshow:
-        search_string = f"{tvshow} S{int(season):02d}E{int(episode):02d}" if title != tvshow else f"{tvshow} ({int(season):02d}{int(episode):02d})"
-    else:
-        search_string = f"{title} ({year})" if year else title
-
-    log(__name__, f"{DEBUG_PRETEXT} Search string = {search_string}")
-    get_subtitles_list(title, search_string, "ar", "Arabic", subtitles_list)
-    return subtitles_list, "", msg
+def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
+    name = tvshow or title
+    if LANGUAGE not in (lang1, lang2, lang3) or not name or not name.strip():
+        return [], "", ""
+    episode_tag = ".s%02de%02d." % (int(season), int(episode)) if tvshow else None
+    prefixes = [v + '.' for v in title_variations(name)]
+    hits, year_hits = [], []
+    for filename in get_file_list():
+        norm = normalize(filename) + '.'
+        if not any(norm.startswith(p) for p in prefixes) or episode_tag and episode_tag not in norm:
+            continue
+        hits.append(filename)
+        if year and '.%s.' % year in norm:
+            year_hits.append(filename)
+    log(__name__, "%d files match %s (%d with year %s)" % (len(hits), prefixes, len(year_hits), year))
+    subtitles_list = [{'filename': os.path.splitext(f)[0], 'id': f, 'language_name': LANGUAGE, 'sync': False}
+                      for f in (year_hits or hits)]
+    return subtitles_list, "", ""
 
 
 def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):
-    subtitle_info = subtitles_list[pos]
-    language = subtitle_info["language_name"]
-    subtitle_id = subtitle_info["id"]
-    print(subtitle_id)
-    download_link = f"{MAIN_URL}/download/mora25r/{subtitle_id}"
-    print(download_link)
-    log(__name__, f"{DEBUG_PRETEXT} Downloading from: {download_link}")
-
-    try:
-        response = SESSION.get(download_link, headers=HEADERS, verify=False, allow_redirects=True)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        log(__name__, f"{DEBUG_PRETEXT} Download failed: {e}")
-        return False, language, None
-
-    os.makedirs(tmp_sub_dir, exist_ok=True)
-    local_tmp_file = os.path.join(tmp_sub_dir, subtitle_id)
-    try:
-        with open(local_tmp_file, "wb") as file:
-            file.write(response.content)
-        log(__name__, f"{DEBUG_PRETEXT} Subtitles saved to: {local_tmp_file}")
-    except Exception as e:
-        log(__name__, f"{DEBUG_PRETEXT} Error saving subtitle: {e}")
-        return False, language, None
-
-    packed = False
-    subs_file = local_tmp_file
-    try:
-        with open(local_tmp_file, "rb") as file:
-            file_header = file.read(2).decode(errors="ignore")
-            if file_header.startswith("R"):
-                packed = True
-                subs_file = "rar"
-            elif file_header.startswith("PK"):
-                packed = True
-                subs_file = "zip"
-            else:
-                subs_file = local_tmp_file
-    except Exception as e:
-        log(__name__, f"{DEBUG_PRETEXT} Error checking file type: {e}")
-
-    log(__name__, f"{DEBUG_PRETEXT} Returning: packed={packed}, language={language}, subs_file={subs_file}")
-    return packed, language, subs_file
-
-
-def get_subtitles_list(title, search_string, lang_short, lang_long, subtitles_list):
-    url = f"{MAIN_URL}/download/mora25r"
-    log(__name__, f"{DEBUG_PRETEXT} Fetching: {url}")
-
-    try:
-        content = SESSION.get(url, headers=HEADERS, verify=False).text
-    except requests.RequestException as e:
-        log(__name__, f"{DEBUG_PRETEXT} Failed to fetch subtitles: {e}")
-        return
-
-    try:
-        encoded_title = quote_plus(title).replace('+', '.')
-        subtitles = re.findall(rf'(<td><a href.+?>{encoded_title}.+?</a></td>)', content, re.IGNORECASE)
-
-        for subtitle in subtitles:
-            match = re.search(r'<td><a href="(.+?)">(.+?)</a></td>', subtitle)
-            if match:
-                id_, filename = match.groups()
-                filename = filename.replace('.srt', '').strip()
-                if filename not in ['Εργαστήρι Υποτίτλων', 'subs4series']:
-                    log(__name__, f"{DEBUG_PRETEXT} Found subtitle: {filename} (id = {id_})")
-                    subtitles_list.append({
-                        'no_files': 1,
-                        'filename': filename,
-                        'sync': True,
-                        'id': id_,
-                        'language_flag': f'flags/{lang_short}.gif',
-                        'language_name': lang_long
-                    })
-    except Exception as e:
-        log(__name__, f"{DEBUG_PRETEXT} Error parsing subtitles: {e}")
+    sub = subtitles_list[pos]
+    r = requests.get(DOWNLOAD_URL + quote(sub['id']), headers={'User-Agent': get_random_ua()}, timeout=30)
+    r.raise_for_status()
+    if not r.content:
+        raise Exception("empty subtitle file")
+    path = os.path.join(tmp_sub_dir, os.path.basename(sub['id']))
+    with open(path, 'wb') as f:
+        f.write(r.content)
+    return False, sub['language_name'], path

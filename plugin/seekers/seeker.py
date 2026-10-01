@@ -15,7 +15,6 @@
 #    GNU General Public License for more details.
 #
 #################################################################################
-from __future__ import absolute_import
 import socket
 import sys
 import time
@@ -129,16 +128,24 @@ class BaseSeeker(object):
                 valid_langs.remove(l)
                 self.log.info('this language is not supported by this provider - "%s"!' % languageTranslate(l, 2, 0))
         try:
-            subtitles = self._search(title, filepath, valid_langs, season, episode, tvshow, year)
-        except socket.timeout as e:
+            if langs and not valid_langs:  # don't fall back to the provider's default languages
+                subtitles = {'list': []}
+            else:
+                subtitles = self._search(title, filepath, valid_langs, season, episode, tvshow, year)
+        except (socket.timeout, TimeoutError) as e:
             self.log.error("timeout error occured: %s" % (str(e)))
-            e = SubtitlesSearchError(SubtitlesErrors.TIMEOUT_ERROR, "timeout!")
-            e.provider = self.id
-            raise
+            err = SubtitlesSearchError(SubtitlesErrors.TIMEOUT_ERROR, "timeout!")
+            err.provider = self.id
+            raise err
         except SubtitlesSearchError as e:
             self.log.error("search error occured: %s" % str(e))
             e.provider = self.id
             raise e
+        except BaseSubtitlesError as e:  # i.e. credential errors raised by shared search/download helpers
+            self.log.error("search error occured: %s" % str(e))
+            err = SubtitlesSearchError(e.code, e.msg)
+            err.provider = self.id
+            raise err
         except Exception as e:
             self.log.error("unknown search error occured: %s" % str(e))
             err = SubtitlesSearchError(SubtitlesErrors.UNKNOWN_ERROR, str(e))

@@ -51,9 +51,14 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Vivaldi/6.5.3206.53",
 ]
 
-# Function to get a random User-Agent string
+# REST APIs (OpenSubtitles, SubDL, SubSource, Wyzie) want a stable "AppName vX" identity
+API_USER_AGENT = "SubsSupport v1.8.0"
 
 
 def get_random_ua():
     import random
     return random.choice(USER_AGENTS)
+
+
+def get_api_user_agent():
+    return API_USER_AGENT

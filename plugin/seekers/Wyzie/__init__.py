@@ -1,2 +1,2 @@
 # Dummy file to make this directory a package.
-from . import service as subtitlesmora
+from . import service as wyzie
