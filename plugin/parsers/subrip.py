@@ -1,4 +1,3 @@
-from __future__ import absolute_import
 import re
 
 from .baseparser import BaseParser, ParseError, HEX_COLORS
@@ -6,7 +5,7 @@ from .baseparser import BaseParser, ParseError, HEX_COLORS
 
 class SubRipParser(BaseParser):
     format = "SubRip"
-    parsing = ('.srt',)
+    parsing = ('.srt', '.sub')  # some providers ship SubRip as .sub, MicroDVD/SubViewer are tried next
 
     def _parse(self, text, fps):
         return self._srt_to_dict(text)
@@ -21,10 +20,11 @@ class SubRipParser(BaseParser):
             line = re.sub('<[^>]*>', '', line)
             # Remove SSA/ASS positioning tags like {\an8}
             line = re.sub(r'\{.*?\}', '', line)
+            line = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', line.replace('\t', ' ')).strip()
             cleaned_lines.append(line)
 
-        # Join back with newlines to preserve the multi-line structure
-        return '\n'.join(cleaned_lines)
+        # Join back with newlines to preserve the multi-line structure, without empty lines
+        return '\n'.join(filter(None, cleaned_lines))
 
     def _getColor(self, text, color):
         newColor = color
@@ -47,7 +47,7 @@ class SubRipParser(BaseParser):
             colorText = colorText.replace("'", "").replace('"', '')
 
         if colorText:
-            hexColor = re.search(r"(\#[0-9,a-f,A-F]{6})", colorText)
+            hexColor = re.search(r"(#[0-9,a-f,A-F]{6})", colorText)
             if hexColor:
                 color = hexColor.group(1)[1:]
             else:

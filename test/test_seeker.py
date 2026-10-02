@@ -21,17 +21,17 @@ def remove_files_in_dir(dirpath):
             os.remove(fpath)
 
 
-def captcha_cb(self, url):
+def captcha_cb(url):
         print('[captcha_cb] visit url:"%s"\nre-type captcha:' % url)
         print('[captcha_cb] not visiting just returning empty string')
         return ""
 
 
-def message_cb(self, text):
+def message_cb(text):
     print('[message_cb] %s' % text)
 
 
-def delay_cb(self, seconds):
+def delay_cb(seconds):
     print('[delay_cb] waiting for %d seconds' % seconds)
     for i in range(seconds):
         print('[delay_cb] %d second')

@@ -1,209 +1,109 @@
-import requests
-import os
+# -*- coding: utf-8 -*-
+# SubDL API (https://subdl.com/api-doc), a free API key is required
 import re
-import json
 from urllib.parse import quote_plus
-from ..utilities import log
-from .SubdlUtilities import get_language_info
+
+import requests
+
 from ..seeker import SubtitlesDownloadError, SubtitlesErrors
+from ..user_agents import get_api_user_agent, get_random_ua
+from ..utilities import languageTranslate, log, saveSubtitle, stripYear, wantedLanguages
 
 SEARCH_URL = "https://api.subdl.com/api/v1/subtitles"
 DOWNLOAD_URL = "https://dl.subdl.com"
+API_TIMEOUT = 15
+DOWNLOAD_TIMEOUT = 30
+
+# our iso639-1 codes -> SubDL language codes
+SUBDL_LANG_CODES = {"pt-br": "BR_PT"}
+
+settings_provider = None
 
 
-def get_subdl_api():
-    global settings_provider  # Ensure we're using the existing instance
-    API_KEY = settings_provider.getSetting("Subdl_API_KEY")
-    if API_KEY:
-        return API_KEY
-    print("Error: SubDL API key is missing.")
-    return None
+def _api_key():
+    key = settings_provider.getSetting("Subdl_API_KEY").strip()
+    if not key:
+        raise SubtitlesDownloadError(SubtitlesErrors.NO_CREDENTIALS_ERROR, "SubDL requires an API key")
+    return key
 
 
-def prepare_search_string(s):
-    s = s.replace("'", "").strip()
-    s = re.sub(r'\(\d\d\d\d\)$', '', s)  # remove year from title
-    s = quote_plus(s)
-    return s
+def _lang_name(item):
+    code = (item.get("language") or "").lower()
+    if code == "br_pt":
+        code = "pt-br"
+    return languageTranslate(code, 2, 0) or (item.get("lang") or "").capitalize()
 
 
-def get_subtitles_list_movie(searchstring, title, languageshort, languagelong, subtitles_list):
-    """Fetches subtitles from the SubDL API and adds them to subtitles_list."""
-    if not searchstring:
-        print("Empty search string provided")
-        return
-
-    API_KEY = get_subdl_api()
-    if not API_KEY:
-        print("Error: SubDL API key is missing.")
-        return
-
-    try:
-        params = {
-            "api_key": API_KEY,
-            "film_name": searchstring,
-            "type": "movie",
-            "imdb_id": None,
-            "languages": languageshort,
-            "subs_per_page": 50
-        }
-
-        response = requests.get(SEARCH_URL, params=params)
-        response.raise_for_status()  # Raises exception for bad status codes
-
-        json_data = response.json()
-        status = json_data.get("status", False)
-
-        if status:
-            all_subs_data = json_data.get("subtitles", [])
-            for item in all_subs_data:
-                try:
-                    language = item.get("lang")
-                    filename = item.get("release_name")
-                    id = item.get("url")
-                    if language and filename and id:
-                        subtitles_list.append({
-                            'filename': filename,
-                            'sync': True,
-                            'id': id,
-                            'language_flag': languageshort,
-                            'language_name': languagelong
-                        })
-                except Exception as e:
-                    print(f"Error processing subtitle item: {e}")
-    except Exception as e:
-        print(f"Error in get_subtitles_list_movie: {e}")
+def _search(params):
+    params["api_key"] = _api_key()
+    params["subs_per_page"] = 30
+    response = requests.get(SEARCH_URL, params=params, headers={"User-Agent": get_api_user_agent()}, timeout=API_TIMEOUT)
+    if response.status_code in (401, 403):
+        raise SubtitlesDownloadError(SubtitlesErrors.INVALID_CREDENTIALS_ERROR, "SubDL API key rejected")
+    if "json" not in response.headers.get("content-type", ""):  # errors other than "not found"
+        response.raise_for_status()
+    data = response.json()
+    if not data.get("status"):
+        log(__name__, "search failed: %s" % (data.get("error") or data.get("message")))
+        return []
+    return data.get("subtitles") or []
 
 
-def get_subtitles_list_tv(searchstring, tvshow, season, episode, languageshort, languagelong, subtitles_list):
-    """Fetches subtitles from the SubDL API and adds them to subtitles_list."""
-    if not searchstring:
-        print("Empty search string provided")
-        return
-
-    API_KEY = get_subdl_api()
-    if not API_KEY:
-        print("Error: SubDL API key is missing.")
-        return
-
-    try:
-        params = {
-            "api_key": API_KEY,
-            "file_name": searchstring,
-            "type": "tv",
-            "imdb_id": None,
-            "season_number": season,
-            "episode_number": episode,
-            "languages": languageshort,
-            "subs_per_page": 50
-        }
-
-        response = requests.get(SEARCH_URL, params=params)
-        response.raise_for_status()  # Raises exception for bad status codes
-
-        json_data = response.json()
-        status = json_data.get("status", False)
-
-        if status:
-            all_subs_data = json_data.get("subtitles", [])
-            for item in all_subs_data:
-                try:
-                    language = item.get("lang")
-                    filename = item.get("release_name")
-                    id = item.get("url")
-                    if language and filename and id:
-                        subtitles_list.append({
-                            'filename': filename,
-                            'sync': True,
-                            'id': id,
-                            'language_flag': languageshort,
-                            'language_name': languagelong
-                        })
-                except Exception as e:
-                    print(f"Error processing subtitle item: {e}")
-    except Exception as e:
-        print(f"Error in get_subtitles_list_tv: {e}")
+def test_credentials():
+    _search({"film_name": "The Matrix", "type": "movie", "languages": "EN"})
+    return "SubDL API key OK"
 
 
-def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):  # standard input
-    # Initialize empty list and message
+def search_subtitles(file_original_path, title, tvshow, year, season, episode, set_temp, rar, lang1, lang2, lang3, stack):
+    langs = [SUBDL_LANG_CODES.get(code, code.upper()) for code in wantedLanguages(lang1, lang2, lang3)]
+    params = {"languages": ",".join(langs)}
+    if tvshow:
+        params.update({"film_name": tvshow, "type": "tv"})
+        if season:
+            params["season_number"] = int(season)
+        if episode:
+            params["episode_number"] = int(episode)
+    else:
+        params.update({"film_name": stripYear(title), "type": "movie"})
+        if year:
+            params["year"] = year
+    log(__name__, "search params: %s" % params)
+
     subtitles_list = []
-    msg = ""
-
-    # Get language info
-    languagefound = lang1
-    language_info = get_language_info(languagefound)
-    language_info1 = language_info['name']
-    language_info2 = language_info['2et']
-    language_info3 = language_info['3et']
-
-    # Check if we have something to search for
-    if not title and not tvshow and not file_original_path:
-        print("Nothing to search for - empty title, tvshow and file path")
-        return subtitles_list, "", msg
-
-    try:
-        # Try to extract title from filename if no title/tvshow provided
-        if not title and not tvshow and file_original_path:
-            try:
-                filename = os.path.basename(file_original_path)
-                # Simple pattern to extract title from filename
-                match = re.match(r'^(.*?)(?:\.\d{4}|\.S\d{2}E\d{2}|\.\d{3,4}p|\.\w{2,3})?\.\w+$', filename)
-                if match:
-                    title = match.group(1).replace('.', ' ').strip()
-                    print(f"Derived title from filename: {title}")
-            except Exception as e:
-                print(f"Error extracting title from filename: {e}")
-
-        if len(tvshow) == 0 and year:  # Movie
-            searchstring = "%s (%s)" % (title, year)
-            print(("searchstring", searchstring))
-            get_subtitles_list_movie(searchstring, title, language_info2, language_info1, subtitles_list)
-        elif len(tvshow) > 0 and title == tvshow:  # Movie not in Library
-            print(len(tvshow))
-            searchstring = "%s" % (tvshow)
-            print(("searchstring", searchstring))
-            get_subtitles_list_tv(searchstring, tvshow, season, episode, language_info2, language_info1, subtitles_list)
-        elif len(tvshow) > 0:  # TVShow
-            searchstring = "%s S%#02dE%#02d" % (tvshow, int(season), int(episode))
-            print(("searchstring", searchstring))
-            get_subtitles_list_tv(searchstring, tvshow, season, episode, language_info2, language_info1, subtitles_list)
-        elif title:  # Just title
-            searchstring = title.replace(' ', '+').replace("'", "").lower()
-            print(("searchstring", searchstring))
-            get_subtitles_list_movie(searchstring, title, language_info2, language_info1, subtitles_list)
-    except Exception as e:
-        print(f"Error in search_subtitles: {e}")
-        return subtitles_list, "", str(e)
-
-    return subtitles_list, "", msg  # standard output
+    for item in _search(params):
+        if not item.get("url"):
+            continue
+        name = item.get("release_name") or item.get("name") or title
+        if tvshow and item.get("full_season"):
+            name = "[S%02d] %s" % (int(item.get("season") or 0), name)
+        subtitles_list.append({
+            "id": item["url"],
+            "filename": name,
+            "language_name": _lang_name(item),
+            "sync": False,
+        })
+    return subtitles_list, "", ""
 
 
 def download_subtitles(subtitles_list, pos, zip_subs, tmp_sub_dir, sub_folder, session_id):
-    subtitle_id = subtitles_list[pos]["id"]
-    language = subtitles_list[pos]["language_name"]
-    download_url = DOWNLOAD_URL + subtitle_id
-    response = requests.get(download_url, stream=True)
-    local_tmp_file = zip_subs
-    packed = False
-    subs_file = ""
-
-    if response.status_code == 200:
-        os.makedirs(tmp_sub_dir, exist_ok=True)
-        with open(local_tmp_file, 'wb') as file:
-            for chunk in response.iter_content(chunk_size=1024):
-                if chunk:
-                    file.write(chunk)
-
-        with open(local_tmp_file, "rb") as f:
-            header = f.read(2)
-            if header.startswith(b'R'):
-                packed = True
-                subs_file = "rar"
-            elif header.startswith(b'P'):
-                packed = True
-                subs_file = "zip"
-            else:
-                subs_file = local_tmp_file
-
-    return packed, language, subs_file
+    subtitle = subtitles_list[pos]
+    url = DOWNLOAD_URL + subtitle["id"]
+    api_key = _api_key()
+    # the cdn serves free keys only for some url forms, try them in order
+    attempts = [url, re.sub(r"\.(zip|rar)$", "", url), "%s?api_key=%s" % (url, quote_plus(api_key))]
+    headers = {"User-Agent": get_random_ua(), "Accept": "*/*"}
+    content = None
+    for attempt in attempts:
+        try:
+            response = requests.get(attempt, headers=headers, timeout=DOWNLOAD_TIMEOUT)
+        except requests.RequestException as e:
+            log(__name__, "download %s failed: %s" % (attempt, e))
+            continue
+        if response.status_code == 200 and response.content:
+            content = response.content
+            break
+        log(__name__, "download %s: HTTP %s" % (attempt, response.status_code))
+    if content is None:
+        raise SubtitlesDownloadError(SubtitlesErrors.UNKNOWN_ERROR, "SubDL download failed")
+    filepath = saveSubtitle(tmp_sub_dir, subtitle["id"].rsplit("/", 1)[-1] or "subdl.zip", content)
+    return False, subtitle["language_name"], filepath

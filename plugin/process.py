@@ -16,7 +16,6 @@
 #
 #################################################################################
 
-from __future__ import absolute_import, division
 import os
 import traceback
 
@@ -106,7 +105,7 @@ class SubsLoader(object):
             raise LoadError('"%s" - not supported subtitles size: "%dKB"' % (os.path.basename(subfile), size // 1024))
         try:
             text = load(subfile)
-        except (URLError, HTTPError, IOError) as e:
+        except (URLError, HTTPError, OSError) as e:
             self.log.error("<%s> %s", filename, str(e))
             raise LoadError(subfile)
         try:

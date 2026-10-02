@@ -36,7 +36,7 @@ class BaseParser(object):
 
     @classmethod
     def canParse(cls, ext):
-        return ext in cls.parsing
+        return ext.lower() in cls.parsing
 
     def __init__(self, rowParse=False):
         self.rowParse = rowParse
@@ -60,44 +60,29 @@ class BaseParser(object):
                     rowStyle, newStyle = self.getStyle(line, newStyle)
                     rowColor, newColor = self.getColor(line, newColor)
                     rowText = self.removeTags(line)
-                    # Apply RTL line by line
-                    rowText = self._apply_rtl(rowText)
                     rows.append({"text": rowText, "style": rowStyle, 'color': rowColor})
             return {'rows': rows, 'start': start, 'end': end, 'duration': duration}
         else:
             style, newStyle = self.getStyle(text)
             color, newColor = self.getColor(text)
             text = self.removeTags(text)
-            text = self._apply_rtl(text)
             return {'text': text, 'style': style, 'color': color, 'start': start, 'end': end, 'duration': duration}
 
     def parse(self, text, fps=None):
-        # Ensure text is str (not bytes)
-        if isinstance(text, bytes):
-            try:
-                text = text.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                text = text.decode("cp1256", errors="ignore")
-
-        # Clean BOM if still present
-        if text.startswith(u"\ufeff"):
+        # text is already decoded by SubsLoader
+        if text.startswith('\ufeff'):
             text = text[1:]
 
         text = text.strip()
-        text = text.replace('\x00', '').replace('.', '')
-        text = re.sub(u'[\u064e\u064f\u0650\u0651\u0652\u064c\u064b\u064d\u0640\ufc62]', '', text)
+        text = text.replace('\x00', '').replace('\r\n', '\n').replace('\r', '\n')
+        text = re.sub('[\u064e\u064f\u0650\u0651\u0652\u064c\u064b\u064d\u0640\ufc62]', '', text)
+        # direction marks/isolates are shown as garbage by enigma2, the renderer handles RTL itself
+        text = re.sub('[\u200E\u200F\u202A-\u202E\u2066-\u2069]', '', text).strip()
 
         sublist = self._parse(text, fps)
         if len(sublist) <= 1:
             raise NoSubtitlesParseError()
         return sublist
-
-    # 🔹 NEW FUNCTION
-    def _apply_rtl(self, text):
-        # If contains Arabic characters, wrap with RTL markers
-        if re.search(r'[\u0600-\u06FF]', text):
-            return u"\u202B" + text + u"\u202C"
-        return text
 
     def getColor(self, text, color=None):
         color, newColor = self._getColor(text, color)

@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
+import os
 import re
 import struct
 import unicodedata
-from hashlib import md5
 from urllib.request import Request, urlopen
-import os
 
 SUPRESS_LOG = True
+IMDB_TIMEOUT = 10
 
 
 def log(module, msg):
@@ -21,7 +21,7 @@ LANGUAGES = (
 
     ("Albanian", "29", "sq", "alb", "0", 30201),
     ("Arabic", "12", "ar", "ara", "1", 30202),
-    ("Belarusian", "0", "hy", "arm", "2", 30203),
+    ("Armenian", "0", "hy", "arm", "2", 30203),
     ("Bosnian", "10", "bs", "bos", "3", 30204),
     ("Bulgarian", "33", "bg", "bul", "4", 30205),
     ("Catalan", "53", "ca", "cat", "5", 30206),
@@ -98,6 +98,7 @@ REGEX_EXPRESSIONS = [r'[Ss]([0-9]+)[\]\[._-]*[Ee]([0-9]+)([^\\\\/]*)$',
 
 LANG_COUNTRY = {"ar": "AE",
                 "bg": "BG",
+                "bs": "BA",
                 "ca": "AD",
                 "cs": "CZ",
                 "da": "DK",
@@ -123,7 +124,7 @@ LANG_COUNTRY = {"ar": "AE",
                 "no": "NO",
                 "pl": "PL",
                 "pt": "PT",
-                "pt-BR": "BR",
+                "pt-br": "BR",
                 "ro": "RO",
                 "ru": "RU",
                 "sk": "SK",
@@ -132,7 +133,26 @@ LANG_COUNTRY = {"ar": "AE",
                 "sv": "SE",
                 "th": "TH",
                 "tr": "TR",
-                "uk": "UA"}
+                "uk": "UA",
+                "zh": "CN"}
+
+# site language names (normalized) that languageTranslate() does not know
+LANG_ALIASES = {
+    'farsi persian': 'fa', 'brazilian portuguese': 'pt-br', 'brazillian portuguese': 'pt-br',
+    'portuguese brazilian': 'pt-br', 'chinese bg code': 'zh', 'chinese simplified': 'zh',
+    'chinese traditional': 'zh', 'big 5 code': 'zh', 'spanish spain': 'es', 'spanish latin america': 'es',
+    'ukranian': 'uk'}
+
+# Subscene season page names
+SEASONS = ["Specials", "First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth",
+           "Eleventh", "Twelfth", "Thirteenth", "Fourteenth", "Fifteenth", "Sixteenth", "Seventeenth", "Eighteenth",
+           "Nineteenth", "Twentieth", "Twenty-first", "Twenty-second", "Twenty-third", "Twenty-fourth", "Twenty-fifth"]
+
+ROMAN = (('xx', 20), ('xix', 19), ('xviii', 18), ('xvii', 17), ('xvi', 16), ('xv', 15), ('xiv', 14), ('xiii', 13),
+         ('xii', 12), ('xi', 11), ('x', 10), ('ix', 9), ('viii', 8), ('vii', 7), ('vi', 6), ('v', 5), ('iv', 4),
+         ('iii', 3), ('ii', 2))
+ROMAN_TO_INT = dict((r, str(n)) for r, n in ROMAN)
+INT_TO_ROMAN = dict((str(n), r) for r, n in ROMAN)
 
 LANGNAME_ISO6391 = dict(map(lambda lang: (lang[0], lang[2]), LANGUAGES))
 LANGNAME_ISO6392 = dict(map(lambda lang: (lang[0], lang[3]), LANGUAGES))
@@ -225,7 +245,6 @@ def regex_movie(title):
 
 
 def regex_tvshow(compare, file, sub=""):
-    sub_info = ""
     tvshow = 0
 
     for regex in REGEX_EXPRESSIONS:
@@ -248,7 +267,6 @@ def regex_tvshow(compare, file, sub=""):
             response_sub = re.findall(regex, sub)
             if len(response_sub) > 0:
                 try:
-                    sub_info = "Regex Subtitle Ep: %s," % (str(response_sub[0][1]),)
                     if (int(response_sub[0][1]) == int(response_file[0][1])):
                         return True
                 except:
@@ -260,101 +278,164 @@ def regex_tvshow(compare, file, sub=""):
         return "", "", ""
 
 
-def hashFile(file_path, rar):
-    if rar:
-        return OpensubtitlesHashRar(file_path)
-
+def hashFile(file_path):
     log(__name__, "Hash Standard file")
-    longlongformat = 'q'  # long long
-    bytesize = struct.calcsize(longlongformat)
-    f = open(file_path, 'r')
-
-    filesize = getFileSize(file_path)
-    hash = filesize
-
+    filesize = os.path.getsize(file_path)
     if filesize < 65536 * 2:
-        return "SizeError"
-
-    buffer = f.read(65536)
-    f.seek(max(0, filesize - 65536), 0)
-    buffer += f.read(65536)
-    f.close()
-    for x in range((65536 / bytesize) * 2):
-        size = x * bytesize
-        (l_value,) = struct.unpack(longlongformat, buffer[size:size + bytesize])
-        hash += l_value
-        hash = hash & 0xFFFFFFFFFFFFFFFF
-
-    returnHash = "%016x" % hash
-    return filesize, returnHash
+        raise ValueError("file too small for hashing")
+    with open(file_path, 'rb') as f:
+        buffer = f.read(65536)
+        f.seek(filesize - 65536, 0)
+        buffer += f.read(65536)
+    hash = filesize
+    for (l_value,) in struct.iter_unpack('<q', buffer):
+        hash = (hash + l_value) & 0xFFFFFFFFFFFFFFFF
+    return filesize, "%016x" % hash
 
 
-def normalizeString(str):
-    return unicodedata.normalize(
-           'NFKD', str
-           ).encode('ascii', 'ignore')
+def stripYear(title):
+    """'The Matrix (1999)' -> 'The Matrix'"""
+    return re.sub(r"\s*\(\d{4}\)$", "", title or "").strip()
 
 
-def OpensubtitlesHashRar(firsrarfile):
-    log(__name__, "Hash Rar file")
-    f = open(firsrarfile, 'r')
-    a = f.read(4)
-    if a != 'Rar!':
-        raise Exception('ERROR: This is not rar file.')
-    seek = 0
-    for i in list(range(4)):
-        f.seek(max(0, seek), 0)
-        a = f.read(100)
-        type, flag, size = struct.unpack('<BHH', a[2:2 + 5])
-        if 0x74 == type:
-            if 0x30 != struct.unpack('<B', a[25:25 + 1])[0]:
-                raise Exception('Bad compression method! Work only for "store".')
-            s_partiizebodystart = seek + size
-            s_partiizebody, s_unpacksize = struct.unpack('<II', a[7:7 + 2 * 4])
-            if (flag & 0x0100):
-                s_unpacksize = (struct.unpack('<I', a[36:36 + 4])[0] << 32) + s_unpacksize
-                log(__name__, 'Hash untested for files biger that 2gb. May work or may generate bad hash.')
-            lastrarfile = getlastsplit(firsrarfile, (s_unpacksize - 1) / s_partiizebody)
-            hash = addfilehash(firsrarfile, s_unpacksize, s_partiizebodystart)
-            hash = addfilehash(lastrarfile, hash, (s_unpacksize % s_partiizebody) + s_partiizebodystart - 65536)
-            f.close()
-            return (s_unpacksize, "%016x" % hash)
-        seek += size
-    raise Exception('ERROR: Not Body part in rar file.')
+def yearMatch(found, year):
+    """True when a year is unknown or both differ by one at most (release years differ between countries)."""
+    try:
+        return abs(int(found) - int(year)) <= 1
+    except (TypeError, ValueError):
+        return True
 
 
-def getlastsplit(firsrarfile, x):
-    if firsrarfile[-3:] == '001':
-        return firsrarfile[:-3] + ('%03d' % (x + 1))
-    if firsrarfile[-11:-6] == '.part':
-        return firsrarfile[0:-6] + ('%02d' % (x + 1)) + firsrarfile[-4:]
-    if firsrarfile[-10:-5] == '.part':
-        return firsrarfile[0:-5] + ('%1d' % (x + 1)) + firsrarfile[-4:]
-    return firsrarfile[0:-2] + ('%02d' % (x - 1))
+def normalizeTitle(title):
+    """'Fate of the Furious, The' -> 'the fate of the furious', 'Amélie' -> 'amelie'"""
+    title = re.sub(r'^(.*), (the|a|an)$', r'\2 \1', (title or '').strip(), flags=re.I)
+    title = unicodedata.normalize('NFKD', re.sub(r"['`]", '', title.lower()).replace('&', ' and '))
+    return ' '.join(re.findall(r'[^\W_]+', ''.join(c for c in title if not unicodedata.combining(c))))
 
 
-def addfilehash(name, hash, seek):
-    f = open(name, 'r')
-    f.seek(max(0, seek), 0)
-    for i in range(8192):
-        hash += struct.unpack('<q', f.read(8))[0]
-        hash = hash & 0xffffffffffffffff
-    f.close()
-    return hash
+def matchTitle(title, year, results):
+    """Value of the (name, year, value) result that fits title and year best, or None.
 
-
-def hashFileMD5(file_path, buff_size=1048576):
-    # calculate MD5 key from file
-    f = open(file_path, 'r')
-    if f.size() < buff_size:
+    Exact titles win over the main title before a colon ('Dune: Part One') and whole-word partial
+    matches, then the same year and the closest length. Results more than one year off are skipped
+    (an exact title only when it is not the only one), partial matches need a year.
+    """
+    wanted = normalizeTitle(title)
+    if not wanted:
         return None
-    f.seek(0, 0)
-    buff = f.read(buff_size)    # size=1M
-    f.close()
-    # calculate MD5 key from file
-    m = md5()
-    m.update(buff)
-    return m.hexdigest()
+    partial_re = re.compile(r'\b%s\b' % re.escape(wanted))
+    ranked, exact = [], []
+    for name, found_year, value in results:
+        name = name or ''
+        found = normalizeTitle(name)
+        if found == wanted:
+            rank = 0
+            exact.append(value)
+        elif year and found_year and normalizeTitle(re.split(r':| - ', name)[0]) == wanted:
+            rank = 1
+        elif year and found_year and partial_re.search(found):
+            rank = 2
+        else:
+            continue
+        if yearMatch(found_year, year):
+            same_year = not year or str(found_year) == str(year)
+            ranked.append((rank, not same_year, abs(len(found) - len(wanted)), len(ranked), value))
+    if ranked:
+        return min(ranked)[-1]
+    return exact[0] if len(exact) == 1 else None
+
+
+def langCode(name):
+    """Language name (ours or a site's) -> ISO 639-1 code ('pt-br' for Brazilian Portuguese) or None."""
+    name = (name or '').strip()
+    norm = re.sub(r'[^a-z0-9]+', ' ', name.lower()).strip()
+    code = LANG_ALIASES.get(norm) or languageTranslate(name, 0, 2) or languageTranslate(norm.title(), 0, 2)
+    return 'pt-br' if code == 'pb' else code
+
+
+def wantedLanguages(*names):
+    """{ISO 639-1 code: language name} of the requested languages known to the plugin, in request order."""
+    wanted = {}
+    for name in names:
+        code = langCode(name)
+        if code and code not in wanted:
+            wanted[code] = name
+    return wanted
+
+
+def episodeFilters(season, episode):
+    """Regexes for release names: (this episode, any episode, this season)."""
+    ordinal = SEASONS[season] if season < len(SEASONS) else None
+    this_episode = re.compile(r'(?:s0*%d[ ._-]*e0*%d|\b0*%dx0*%d)(?!\d)' % (season, episode, season, episode), re.I)
+    any_episode = re.compile(r's\d+[ ._-]*e\d+|\b\d+x\d+\b|\be(?:p|pisode)?[ ._-]*\d+\b', re.I)
+    this_season = r'(?<![a-z])s0*%d(?!\d)|season[ ._-]*0*%d(?!\d)' % (season, season)
+    if ordinal:
+        this_season += '|%s season' % ordinal
+    return this_episode, any_episode, re.compile(this_season, re.I)
+
+
+def romanVariations(words):
+    """Word list with Roman numerals as digits and vice versa (['rocky', 'ii'] -> ['rocky', '2']),
+    the first word is kept ('V for Vendetta', '5 Card Stud') and 'I' is left alone."""
+    variations = [words]
+    for table in (ROMAN_TO_INT, INT_TO_ROMAN):
+        variant = words[:1] + [table.get(w, w) for w in words[1:]]
+        if variant not in variations:
+            variations.append(variant)
+    return variations
+
+
+def downloadRating(downloads, per_point=50):
+    """Rating 1-10 (as string) from a download count."""
+    return str(min(10, int(downloads or 0) // per_point + 1))
+
+
+def createSession(referer=None):
+    """requests session with a random browser user agent and an optional Referer."""
+    import requests
+    from .user_agents import get_random_ua
+    session = requests.Session()
+    session.headers['User-Agent'] = get_random_ua()
+    if referer:
+        session.headers['Referer'] = referer
+    return session
+
+
+def saveSubtitle(tmp_sub_dir, filename, content):
+    """Writes a downloaded file to tmp_sub_dir and returns its path, a name without extension
+    gets .zip/.rar/.srt from the content."""
+    if not content or re.match(br'\s*<(?:!doctype|html|\?xml|head|body)', content[:200], re.I):
+        raise Exception('download returned no subtitle file')
+    filename = os.path.basename(filename)
+    if not os.path.splitext(filename)[1]:
+        filename += '.zip' if content[:2] == b'PK' else '.rar' if content[:4] == b'Rar!' else '.srt'
+    path = os.path.join(tmp_sub_dir, filename)
+    with open(path, 'wb') as f:
+        f.write(content)
+    return path
+
+
+def imdbLookup(title, year=None, tvshow=False):
+    """Returns the IMDb id (tt...) for a title via the keyless IMDb suggestion API, or None."""
+    import requests
+    from urllib.parse import quote
+    from .user_agents import get_random_ua
+    query = stripYear(title)
+    if not query:
+        return None
+    url = "https://v3.sg.media-imdb.com/suggestion/x/%s.json" % quote(query.lower())
+    try:
+        items = requests.get(url, headers={"User-Agent": get_random_ua()}, timeout=IMDB_TIMEOUT).json().get("d") or []
+    except Exception as e:
+        log(__name__, "imdb lookup failed: %s" % e)
+        return None
+    kinds = ("tvSeries", "tvMiniSeries") if tvshow else ("movie", "tvMovie", "video")
+    items = [i for i in items if i.get("id", "").startswith("tt") and i.get("qid") in kinds]
+    if year:
+        items = [i for i in items if yearMatch(i.get("y"), year)] or items
+    exact = [i for i in items if i.get("l", "").lower() == query.lower()]
+    items = exact or items
+    return items[0]["id"] if items else None
 
 
 def langToCountry(lang):
@@ -442,31 +523,27 @@ class SimpleLogger(object):
 
     def error(self, text, *args):
         if self.log_level >= self.LOG_ERROR:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[error] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def info(self, text, *args):
         if self.log_level >= self.LOG_INFO:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[info] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def debug(self, text, *args):
         if self.log_level == self.LOG_DEBUG:
-            text = self._eval_message(text, args)
+            text = self._eval_message(text, *args)
             text = "[debug] {0}".format(text)
             out = self._format_output(text)
             self._out_fnc(out)
 
     def _eval_message(self, text, *args):
-        if len(args) == 1 and isinstance(args[0], tuple):
-            text = text % args[0]
-        elif len(args) >= 1:
-            text = text % tuple([a for a in args])
-        return text
+        return text % args if args else text
 
     def _format_output(self, text):
         return self.LOG_FORMAT.format(self.prefix_name, text)

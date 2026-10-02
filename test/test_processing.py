@@ -1,15 +1,18 @@
 from __future__ import print_function
 import os
 import sys
+import types
 import unittest
 
 test = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(os.path.join(test, '..', 'plugin'))
+plugin = types.ModuleType('SubsSupport')
+plugin.__path__ = [os.path.join(test, '..', 'plugin')]
+sys.modules['SubsSupport'] = plugin
 
-from process import SubsLoader, DecodeError, LoadError, \
+from SubsSupport.process import SubsLoader, DecodeError, LoadError, \
     ParseError, ParserNotFoundError
 
-from parsers import SubRipParser, MicroDVDParser
+from SubsSupport.parsers import SubRipParser, MicroDVDParser
 
 PARSERS = [SubRipParser, MicroDVDParser]
 
