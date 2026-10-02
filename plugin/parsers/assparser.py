@@ -8,21 +8,29 @@ class AssParser(BaseParser):
     format = "ASS/SSA"
     parsing = ('.ass', '.ssa')
 
+    # vector drawings ({\p1}...{\p0}) are not text
+    _DRAWING = re.compile(r'\{[^}]*\\p[1-9][^}]*\}.*?(?=\{[^}]*\\p0|$)')
+
     def _removeTags(self, text):
         text = re.sub(r'\{[^}]*\}', '', text)  # override codes like {\an8}, {\i1}
         return text.replace('\\N', '\n').replace('\\n', '\n').replace('\\h', ' ').strip()
 
     def _getStyle(self, text, style):
         if re.search(r'\{[^}]*\\i1', text):
-            return 'italic', style
-        if re.search(r'\{[^}]*\\b1', text):
-            return 'bold', style
-        return '', style
+            style = 'italic'
+        elif re.search(r'\{[^}]*\\b1', text):
+            style = 'bold'
+        elif style not in ('italic', 'bold'):
+            style = ''
+        # rowParse: the style continues on the next row until it is closed
+        if re.search(r'\{[^}]*\\(?:i0|b0|r)', text):
+            return style, ''
+        return style, style
 
     @staticmethod
     def _time(value):
         h, m, s = value.strip().split(':')
-        return int((int(h) * 3600 + int(m) * 60 + float(s)) * 1000)
+        return int(round((int(h) * 3600 + int(m) * 60 + float(s)) * 1000))
 
     def _parse(self, text, fps):
         fields = ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text']
@@ -43,8 +51,10 @@ class AssParser(BaseParser):
                     start, end = self._time(event['start']), self._time(event['end'])
                 except (KeyError, ValueError) as e:
                     raise ParseError("invalid dialogue line: %s (%s)" % (line, e))
-                if self._removeTags(event.get('text', '')):
-                    subs.append((start, end, event['text']))
+                subText = self._DRAWING.sub('', event.get('text', ''))
+                subText = subText.replace('\\N', '\n').replace('\\n', '\n')
+                if self._removeTags(subText):
+                    subs.append((start, end, subText))
         subs.sort(key=lambda sub: sub[0])  # ass files are not required to be sorted
         return [self.createSub(text, start, end) for start, end, text in subs]
 

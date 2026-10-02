@@ -4,12 +4,11 @@ from .baseparser import BaseParser, ParseError
 
 
 class SubViewerParser(BaseParser):
-    """Parser for SubViewer 1.x / 2.0 text subtitles.
+    """Parser for SubViewer 2.0 text subtitles (.sub).
 
-    SubViewer files normally use the .sub extension.  They contain a time
-    range on one line followed by the subtitle text.  SubViewer 2.0 uses
-    ``[br]`` markers for explicit line breaks and can contain an optional
-    metadata header such as ``[INFORMATION]`` and ``[SUBTITLE]``.
+    Each block is a "hh:mm:ss.cc,hh:mm:ss.cc" time range line followed by the
+    text, [br] is an explicit line break.  The optional [INFORMATION] header
+    is skipped.  SubViewer 1.x ([hh:mm:ss] lines) is not supported.
     """
 
     parsing = ('.sub',)
@@ -26,11 +25,6 @@ class SubViewerParser(BaseParser):
     def _parse(self, text, fps=None):
         subs = []
         idx = 0
-
-        # Normalize line endings for predictable block matching.  Preserve
-        # text punctuation and only translate SubViewer line-break markers.
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-
         for match in self._BLOCK_RE.finditer(text):
             try:
                 idx += 1
@@ -42,7 +36,7 @@ class SubViewerParser(BaseParser):
                 # Ignore empty blocks but keep valid punctuation-only entries.
                 if subtitle_text:
                     subs.append(self.createSub(subtitle_text, start, end))
-            except Exception as e:
+            except ValueError as e:
                 raise ParseError(str(e) + ', subtitle_index: %d' % idx)
 
         return subs

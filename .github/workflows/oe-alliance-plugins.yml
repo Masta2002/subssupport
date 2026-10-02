@@ -10,24 +10,21 @@ on:
 jobs:
   build:
     name: Build oe-alliance plugins
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        python: ['3.10','3.11','3.12','3.13']
+        python: ['3.10','3.11','3.12','3.13','3.14']
     steps:
       - name: Install prerequisites
         run: |
-          sudo add-apt-repository -y ppa:deadsnakes/ppa
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get -q update
-          sudo apt remove -y libunwind-14-dev
-          sudo apt-get install -y build-essential autoconf gettext python${{ matrix.python }}-dev libntirpc-dev
+          sudo apt-get install -y autoconf automake gettext
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -36,4 +33,5 @@ jobs:
           autoreconf -i
           ./configure
           make
-          python -m compileall .
+          make install DESTDIR=$PWD/install
+          python -W error -m compileall -q .

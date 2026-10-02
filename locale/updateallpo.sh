@@ -35,10 +35,8 @@ printf "Po files update/creation from script starting.\n"
 printf "Creating temporary file $PluginName-py.pot\n"
 find -s -X ../plugin/ -name "*.py" -exec xgettext --no-wrap -L Python --from-code=UTF-8 -kpgettext:1c,2 --add-comments="TRANSLATORS:" -d $PluginName -s -o $PluginName-py.pot {} \+
 gsed --in-place $PluginName-py.pot --expression=s/CHARSET/UTF-8/
-printf "Creating temporary file $PluginName-xml.pot\n"
-find -s -X ../plugin/ -name "*.xml" -exec python xml2po.py {} \+ > $PluginName-xml.pot
-printf "Merging pot files to create: $PluginName.pot\n"
-cat $PluginName-py.pot $PluginName-xml.pot | msguniq --no-wrap -o $PluginName.pot -
+printf "Creating: $PluginName.pot\n"
+msguniq --no-wrap -o $PluginName.pot $PluginName-py.pot
 OLDIFS=$IFS
 IFS=" "
 for lang in "${languages[@]}" ; do
@@ -49,11 +47,11 @@ for lang in "${languages[@]}" ; do
 		msgfmt -o $lang.mo $lang.po
 	else \
 		printf "New file created: %s.po, please add it to github before commit\n" $lang
-		msginit -l $lang.po -o $lang.po -i $PluginName.pot --no-translator
+		msginit -l $lang -o $lang.po -i $PluginName.pot --no-translator
 		msgfmt -o $lang.mo $lang.po
 	fi
 done
-rm $PluginName-py.pot $PluginName-xml.pot
+rm $PluginName-py.pot
 IFS=$OLDIFS
 printf "Po files update/creation from script finished!\n"
 

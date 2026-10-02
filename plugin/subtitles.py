@@ -21,17 +21,13 @@ from importlib import reload
 import json
 import os
 import re
-import shutil
-import threading
 import time
 import traceback
 from urllib.parse import quote, unquote, urlencode
-from urllib.request import Request, urlopen
 from xml.etree.ElementTree import parse as parse_xml
 
-import requests
-from twisted.internet import threads
-from twisted.internet.defer import Deferred
+from twisted.internet import reactor
+from twisted.internet.defer import CancelledError, Deferred, DeferredList, gatherResults, succeed
 
 from Components.ActionMap import ActionMap, HelpableActionMap
 from Components.ConfigList import ConfigListScreen
@@ -64,7 +60,7 @@ from Tools.ISO639 import LanguageCodes
 from Tools.LoadPixmap import LoadPixmap
 from Components.FileList import FileList
 from .compat import eConnectCallback
-from .e2_utils import messageCB, E2SettingsProvider, MyLanguageSelection, \
+from .e2_utils import downloadPage, fetch, messageCB, E2SettingsProvider, MyLanguageSelection, \
     ConfigFinalText, Captcha, DelayMessageBox, MyConfigList, getFps, fps_float, \
     getFonts, BaseMenuScreen, isFullHD, getDesktopSize
 from enigma import eTimer, eConsoleAppContainer, ePythonMessagePump, eSize, ePoint, RT_HALIGN_LEFT, \
@@ -80,7 +76,7 @@ from .seek import SubsSeeker, SubtitlesDownloadError, SubtitlesErrors
 from .seekers.utilities import detectSearchParams, languageTranslate
 from skin import parseColor, parsePosition, parseFont
 from .utils import SimpleLogger, toUnicode
-from .Tmdb_scraper import scrape_tmdb_movies, scrape_movie_details
+from .Tmdb_scraper import search_movies, movie_details
 
 from . import _, __author__, __version__, __email__
 
@@ -274,95 +270,133 @@ TRANSLATE_LANGUAGE_CHOICES = [
 ]
 
 
-class SubtitleTranslator(object):
-    """Machine translation of subtitle lines (Google gtx endpoint).
-
-    Network requests never run in the enigma2 main thread: the whole subtitle
-    list is prefetched in a background thread after loading and a line that is
-    not translated yet is shown untranslated and replaced once it is ready.
-    """
+class SubtitleTranslator:
+    # Google gtx endpoint, batches are fetched one after another with twisted, nothing blocks the GUI
     URL = "https://translate.googleapis.com/translate_a/single"
+    MAX_CHARS = 3000
+    MAX_ENTRIES = 5000
+    cache = {}  # shared, so a new SubsScreen keeps the prefetched lines
 
-    def __init__(self):
-        self.cache = {}
-        self.maxEntries = 3000
-        self._generation = 0
+    def __init__(self, callback):
+        self.callback = callback  # called after new lines were translated
+        self.generation = 0
+        self.languages = None
+        self.queue = []
+        self.urgent = []
+        self.running = False
+        self.pauseUntil = 0
+        self.delayedCall = None
 
-    def _translate(self, text, source, target):
-        # plain urllib on purpose: the endpoint answers 429 to requests/urllib3 clients
-        query = urlencode({"client": "gtx", "sl": source or "auto", "tl": target, "dt": "t", "q": text})
-        with urlopen(Request(self.URL + "?" + query, headers={"User-Agent": "Mozilla/5.0"}), timeout=5) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        return "".join(part[0] for part in data[0] if part and part[0]).strip() or text
+    def _translate(self, lines, source, target):
+        url = self.URL + "?" + urlencode({"client": "gtx", "sl": source, "tl": target, "dt": "t"})
+        d = fetch(url, data=urlencode({"q": "\n".join(lines)}), timeout=10,
+                  headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
+        return d.addCallback(lambda body: "".join(part[0] for part in json.loads(body)[0] if part and part[0]).split("\n"))
 
-    def _store(self, key, value):
-        self.cache[key] = value
-        while len(self.cache) > self.maxEntries:
-            self.cache.pop(next(iter(self.cache)), None)
+    def _nextBatch(self, source, target):
+        # urgent lines first, lines are popped from the end of the lists
+        batch, size = [], 0
+        for queue in (self.urgent, self.queue):
+            while queue:
+                line = queue[-1]
+                if (source, target, line) in self.cache or line in batch:
+                    queue.pop()
+                elif batch and size + len(line) > self.MAX_CHARS:
+                    return batch
+                else:
+                    batch.append(queue.pop())
+                    size += len(line) + 1
+        return batch
 
-    @staticmethod
-    def _texts(sub):
-        if isinstance(sub.get('rows'), list):
-            return [row.get('text', '') for row in sub['rows'] if isinstance(row, dict)]
-        return [sub.get('text', '')]
+    def _schedule(self, delay, generation, source, target, failures=0):
+        self.delayedCall = reactor.callLater(delay, self._next, generation, source, target, failures)
+
+    def _next(self, generation, source, target, failures=0):
+        self.delayedCall = None
+        if generation != self.generation:
+            return
+        lines = self._nextBatch(source, target)
+        if not lines:
+            self.running = False
+            return
+
+        def checkLines(translated):
+            if len(translated) == len(lines):
+                return translated
+            # line breaks got lost, translate the lines one by one
+            return gatherResults([self._translate([line], source, target) for line in lines]).addCallback(lambda parts: [" ".join(part) for part in parts])
+
+        def done(translated):
+            if generation != self.generation:
+                return
+            for line, text in zip(lines, translated, strict=True):
+                self.cache[(source, target, line)] = text.strip() or line
+            while len(self.cache) > self.MAX_ENTRIES:
+                self.cache.pop(next(iter(self.cache)))
+            self.callback()
+            self._schedule(0.5, generation, source, target)
+
+        def failed(failure):
+            if generation != self.generation:
+                return
+            print("[SubsSupport] translation failed: %s" % failure.getErrorMessage())
+            self.urgent.extend(reversed(lines))
+            if failures >= 3:
+                self.running = False
+                self.pauseUntil = time.time() + 60
+            else:
+                self._schedule(2 * (failures + 1), generation, source, target, failures + 1)
+        self._translate(lines, source, target).addCallback(checkLines).addCallbacks(done, failed)
+
+    def _start(self, source, target):
+        self.running = True
+        self._schedule(0, self.generation, source, target)
 
     def translateSub(self, sub, source, target):
-        """Returns a translated copy of sub, or None when a line is not in the cache yet."""
-        if source == target:
-            return sub
-        translated = []
-        for text in self._texts(sub):
-            if text.strip():
-                text = self.cache.get((source, target, text))
-                if text is None:
+        # returns a translated copy of sub, None when a line is not cached yet
+        lines = []
+        for line in sub['text'].split("\n"):
+            if line.strip():
+                line = self.cache.get((source, target, line))
+                if line is None:
                     return None
-            translated.append(text)
-        out = sub.copy()
-        if isinstance(sub.get('rows'), list):
-            out['rows'] = [dict(row, text=text) for row, text in zip(sub['rows'], translated)]
-            out['text'] = '\n'.join(text for text in translated if text)
-        else:
-            out['text'] = translated[0]
-        return out
+            lines.append(line)
+        return dict(sub, text="\n".join(lines))
 
-    def request(self, sub, source, target, callback):
-        """Translates the lines of one subtitle in a thread and calls callback in the main thread."""
-        def work():
-            for text in self._texts(sub):
-                if text.strip() and (source, target, text) not in self.cache:
-                    self._store((source, target, text), self._translate(text, source, target))
-        threads.deferToThread(work).addCallbacks(lambda _result: callback(), lambda failure: print("[SubsSupport] translation failed:", failure.value))
+    def request(self, sub, source, target):
+        # translates the lines of the shown subtitle before the prefetched ones
+        if time.time() < self.pauseUntil:
+            return
+        if self.languages != (source, target):
+            self.stop()
+            self.languages = (source, target)
+        self.urgent.extend(line for line in reversed(sub['text'].split("\n")) if line.strip())
+        if not self.running:
+            self._start(source, target)
 
     def prefetch(self, subsList, source, target):
-        self._generation += 1
-        generation = self._generation
-        texts = [text for sub in subsList for text in self._texts(sub) if text.strip()]
-
-        def work():
-            failures = 0
-            for text in texts:
-                if generation != self._generation or failures > 5:
-                    return
-                if (source, target, text) in self.cache:
-                    continue
-                try:
-                    self._store((source, target, text), self._translate(text, source, target))
-                except Exception as e:
-                    failures += 1
-                    print("[SubsSupport] translation prefetch failed:", e)
-        thread = threading.Thread(target=work, name="SubsSupportTranslate")
-        thread.daemon = True
-        thread.start()
+        self.stop()
+        self.languages = (source, target)
+        self.queue = list(dict.fromkeys(line for sub in subsList for line in sub['text'].split("\n") if line.strip()))[::-1]
+        self.pauseUntil = 0
+        self._start(source, target)
 
     def stop(self):
-        self._generation += 1
+        self.generation += 1
+        self.languages = None
+        self.queue = []
+        self.urgent = []
+        self.running = False
+        if self.delayedCall and self.delayedCall.active():
+            self.delayedCall.cancel()
+        self.delayedCall = None
 
 
 def _get_translate_target(externalSettings):
-    """Returns (source, target) when line translation is enabled, otherwise None."""
+    # returns (source, target) when line translation is enabled, otherwise None
     try:
         cfg = externalSettings.translate
-        if cfg.mode.value == "line":
+        if cfg.mode.value == "line" and cfg.source.value != cfg.target.value:
             return cfg.source.value, cfg.target.value
     except Exception:
         pass
@@ -409,7 +443,10 @@ def initExternalSettings(configsubsection):
     configsubsection.translate = ConfigSubsection()
     configsubsection.translate.mode = ConfigSelection(default="off", choices=TRANSLATE_MODE_CHOICES)
     configsubsection.translate.source = ConfigSelection(default="auto", choices=TRANSLATE_LANGUAGE_CHOICES)
-    configsubsection.translate.target = ConfigSelection(default="ar", choices=TRANSLATE_LANGUAGE_CHOICES[1:])
+    target = language.getLanguage()[:2]
+    if target not in dict(TRANSLATE_LANGUAGE_CHOICES):
+        target = "en"
+    configsubsection.translate.target = ConfigSelection(default=target, choices=TRANSLATE_LANGUAGE_CHOICES[1:])
 
 
 def initEmbeddedSettings(configsubsection):
@@ -1355,7 +1392,8 @@ class SubtitlesWidget(GUIComponent):
     def __init__(self, boundDynamic=True, boundXOffset=10, boundYOffset=10, boundSize=None, fontSize=25, positionPercent=94):
         GUIComponent.__init__(self)
         self.state = self.STATE_BACKGROUND
-        self.bgType = "static"  # dynamic / static / fixed
+        self.bgType = "dynamic"  # dynamic / static / fixed
+        self.bgHeight = 4  # lines, static and fixed only
         self.boundDynamic = boundDynamic
         self.boundXOffset = boundXOffset
         self.boundYOffset = boundYOffset
@@ -1386,12 +1424,8 @@ class SubtitlesWidget(GUIComponent):
         return int((self.desktopSize[1] - self.calcWidgetHeight() - self.boundYOffset) / float(100) * self.positionPercent) + 40
 
     def calcWidgetHeight(self):
-        backgroundType = config.plugins.subtitlesSupport.external.background.type.value  # Get background type
-        if backgroundType == "fixed":
-            heightFactor = int(config.plugins.subtitlesSupport.external.background.height.value)  # Use user setting
-        else:
-            heightFactor = 4  # Default value for dynamic & static
-        return int(heightFactor * self.font[1] + 15)  # Calculate final height
+        heightFactor = self.bgHeight if self.bgType in ("static", "fixed") else 4
+        return int(heightFactor * self.font[1] + 15)
 
     def update(self):
         ds = self.desktopSize
@@ -1421,50 +1455,29 @@ class SubtitlesWidget(GUIComponent):
                     self.instance2.hide()
                     return
 
-                # Always put real text in instance2 (text label)
                 self.instance2.setText(text)
                 self.instance2.show()
-
                 if self.boundDynamic:
-                    # DYNAMIC background: bar wraps text.
-                    # Some Enigma2 images calculate a more reliable width when
-                    # visible placeholder characters are used instead of spaces.
-                    # Restore the real subtitle immediately after measurement so
-                    # the placeholder dots are never displayed to the viewer.
-                    measure_text = text.replace(' ', '.')
-                    self.instance2.setText(measure_text)
+                    # measure with dots, so spaces are part of calculateSize
+                    self.instance2.setText(text.replace(' ', '.'))
                     ws = self.instance2.calculateSize()
                     self.instance2.setText(text)
                     ws = (ws.width() + self.boundXOffset * 2, ws.height() + self.boundYOffset * 2)
-
                     ds = self.desktopSize
                     bs = self.boundSize
                     wp = self.instance2.position()
                     wp = (wp.x(), wp.y())
                     wpy = wp[1] + (bs[1] - ws[1]) / 2
                     wpx = ds[0] / 2 - ws[0] / 2
-
                     self.instance.resize(eSize(int(ws[0]), int(ws[1])))
                     self.instance.move(ePoint(int(wpx), int(wpy)))
                 else:
-                    # STATIC background: full width, fixed height
                     self.update()
-                    bs = self.boundSize
-                    ds = self.desktopSize
-                    self.instance.resize(eSize(int(bs[0]), int(bs[1])))
-                    self.instance.move(ePoint(int(ds[0] / 2 - bs[0] / 2), int(self.calcWidgetYPosition())))
-
                 self.instance.show()
             elif self.state == self.STATE_FIXED_BACKGROUND:
-                # Fixed = bar always visible, text may come/go
+                # bar always visible, text may come and go
                 self.update()
-
-                # Ensure the fixed background maintains the correct height
-                bs = self.boundSize = (self.desktopSize[0], self.calcWidgetHeight())
-                self.instance.resize(eSize(int(bs[0]), int(bs[1])))
-                self.instance.move(ePoint(int(self.desktopSize[0] / 2 - bs[0] / 2), int(self.calcWidgetYPosition())))
                 self.instance.show()
-
                 if not text:
                     self.instance2.setText("")
                     self.instance2.hide()
@@ -1491,31 +1504,23 @@ class SubtitlesWidget(GUIComponent):
         self.instance2.setForegroundColor(parseColor(color))
 
     def setBackgroundColor(self, color, bgType=None):
-        # bgType: "dynamic" / "static" / "fixed"
         if bgType is not None:
             self.bgType = bgType
-
-        # If alpha == ff => background disabled
-        if color[1:3].lower() == "ff":
+        if color[1:3].lower() == "ff":  # fully transparent, no background
             self.state = self.STATE_NO_BACKGROUND
             self.instance.hide()
             return
-
-        # Background enabled
         self.instance.setBackgroundColor(parseColor(color))
-
         if self.bgType == "fixed":
             self.state = self.STATE_FIXED_BACKGROUND
-            self.instance.show()        # always visible bar
-        else:
-            # static or dynamic => only show when there is text
+            self.instance.show()
+        else:  # shown only together with text
             self.state = self.STATE_BACKGROUND
-            self.instance.hide()        # will show only when text exists
+            self.instance.hide()
 
     def setFixedBackgroundHeight(self, height):
-        self.boundSize = (self.desktopSize[0], int(height) * self.font[1] + 15)
-        self.instance.resize(eSize(int(self.boundSize[0]), int(self.boundSize[1])))
-        self.instance.move(ePoint(int(self.desktopSize[0] / 2 - self.boundSize[0] / 2), int(self.calcWidgetYPosition())))
+        self.bgHeight = int(height)
+        self.update()
 
     def setBorderColor(self, color):
         self.instance.setBorderColor(parseColor(color))
@@ -1573,11 +1578,13 @@ class SubsScreen(Screen):
 
         Screen.__init__(self, session)
         self.stand_alone = True
-        self.translator = SubtitleTranslator()
-        self.currentSub = None
+        self.translator = SubtitleTranslator(self.translationReady)
+        self.pendingSub = None
+        self.subsList = None
         self["subtitles"] = SubtitlesWidget()
         self.onLayoutFinish.append(self.__checkElabelCaps)
         self.onLayoutFinish.append(self.reloadSettings)
+        self.onClose.append(self.translator.stop)
 
     def __checkElabelCaps(self):
         if hasattr(self["subtitles"].instance, 'setBorderWidth') and hasattr(self["subtitles"].instance, 'setBorderColor'):
@@ -1608,12 +1615,8 @@ class SubsScreen(Screen):
             self["subtitles"].setBoundOffset(xOffset, yOffset)
         else:
             self["subtitles"].setBoundDynamic(False)
-            self["subtitles"].setBoundOffset(0, 0)  # optional
-
-        color = "#" + alpha + color
-        self["subtitles"].setBackgroundColor(color, bgType=type)
-
-        if type in ("static", "fixed") and height:
+        self["subtitles"].setBackgroundColor("#" + alpha + color, type)
+        if height:
             self["subtitles"].setFixedBackgroundHeight(height)
 
     def setColor(self, color):
@@ -1668,14 +1671,17 @@ class SubsScreen(Screen):
                 'color': externalSettings.font.bold.alpha.value + externalSettings.font.bold.color.value
             }
         })
+        if self.subsList and _get_translate_target(self.externalSettings) != self.translator.languages:
+            self.prefetchTranslation(self.subsList)
 
     def setSubtitle(self, sub):
-        self.currentSub = sub
+        self.pendingSub = None
         languages = _get_translate_target(self.externalSettings)
         if languages:
             translated = self.translator.translateSub(sub, *languages)
             if translated is None:  # show the original now, the translation when it arrives
-                self.translator.request(sub, languages[0], languages[1], lambda: self.currentSub is sub and self.setSubtitle(sub))
+                self.pendingSub = sub
+                self.translator.request(sub, *languages)
             else:
                 sub = translated
         if sub['style'] != self.selectedFont:
@@ -1689,12 +1695,19 @@ class SubsScreen(Screen):
         self.subShown = True
 
     def hideSubtitle(self):
-        self.currentSub = None
+        self.pendingSub = None
         if self.subShown:
             self["subtitles"].setText("")
             self.subShown = False
 
+    def translationReady(self):
+        sub = self.pendingSub
+        languages = _get_translate_target(self.externalSettings)
+        if sub is not None and languages and self.translator.translateSub(sub, *languages) is not None:
+            self.setSubtitle(sub)
+
     def prefetchTranslation(self, subsList):
+        self.subsList = subsList
         languages = _get_translate_target(self.externalSettings)
         if languages and subsList:
             self.translator.prefetch(subsList, *languages)
@@ -1814,6 +1827,8 @@ class SubsEngine(object):
 
     def setRenderer(self, renderer):
         self.renderer = renderer
+        if self.subsList and hasattr(renderer, "prefetchTranslation"):
+            renderer.prefetchTranslation(self.subsList)
 
     def setPlayerDelay(self, playerDelay):
         self.pause()
@@ -2336,7 +2351,8 @@ class SubsSetupExternal(BaseMenuScreen):
                 configList.append(getConfigListEntry(_("Background Y-offset"), externalSettings.background.yOffset))
             configList.append(getConfigListEntry(_("Background color"), externalSettings.background.color))
             configList.append(getConfigListEntry(_("Background transparency"), externalSettings.background.alpha))
-            configList.append(getConfigListEntry(_("Background height"), externalSettings.background.height))
+            if backgroundType != 'dynamic':
+                configList.append(getConfigListEntry(_("Background height"), externalSettings.background.height))
         configList.append(getConfigListEntry(_("Subtitle translation mode"), externalSettings.translate.mode))
         if externalSettings.translate.mode.getValue() != 'off':
             configList.append(getConfigListEntry(_("Translate from"), externalSettings.translate.source))
@@ -2344,7 +2360,7 @@ class SubsSetupExternal(BaseMenuScreen):
         return configList
 
     def __init__(self, session, externalSettings):
-        BaseMenuScreen.__init__(self, session, _("External Subtitles settings"))
+        BaseMenuScreen.__init__(self, session, _("External Subtitles settings"), on_change=self.buildMenu)
         self.externalSettings = externalSettings
 
     def buildMenu(self):
@@ -2357,30 +2373,10 @@ class SubsSetupExternal(BaseMenuScreen):
         configfile.save()
         self.close(True, changedShadowType)
 
-    def keyLeft(self):
-        ConfigListScreen.keyLeft(self)
-        current = self["config"].getCurrent()[1]
-        if current in [self.externalSettings.shadow.type,
-                       self.externalSettings.shadow.enabled,
-                       self.externalSettings.background.enabled,
-                       self.externalSettings.background.type,
-                       self.externalSettings.translate.mode]:
-            self.buildMenu()
-
-    def keyRight(self):
-        ConfigListScreen.keyRight(self)
-        current = self["config"].getCurrent()[1]
-        if current in [self.externalSettings.shadow.type,
-                       self.externalSettings.shadow.enabled,
-                       self.externalSettings.background.enabled,
-                       self.externalSettings.background.type,
-                       self.externalSettings.translate.mode]:
-            self.buildMenu()
-
 
 class SubsSetupMainMisc(BaseMenuScreen):
     def __init__(self, session, subsSettings):
-        BaseMenuScreen.__init__(self, session, _("Subtitles setting"))
+        BaseMenuScreen.__init__(self, session, _("Subtitles setting"), on_change=self.buildMenu)
         self.subsSettings = subsSettings
         self.showExpertSettings = ConfigYesNo(default=False)
 
@@ -2408,26 +2404,6 @@ class SubsSetupMainMisc(BaseMenuScreen):
             x[1].save()
         configfile.save()
         self.close(True, changedEncodingGroup, changedShadowType)
-
-    def keyLeft(self):
-        ConfigListScreen.keyLeft(self)
-        current = self["config"].getCurrent()[1]
-        if current in [self.subsSettings.external.shadow.type,
-                       self.subsSettings.external.shadow.enabled,
-                       self.showExpertSettings,
-                       self.subsSettings.external.background.enabled,
-                       self.subsSettings.external.background.type]:
-            self.buildMenu()
-
-    def keyRight(self):
-        ConfigListScreen.keyRight(self)
-        current = self["config"].getCurrent()[1]
-        if current in [self.subsSettings.external.shadow.type,
-                       self.subsSettings.external.shadow.enabled,
-                       self.showExpertSettings,
-                       self.subsSettings.external.background.enabled,
-                       self.subsSettings.external.background.type]:
-            self.buildMenu()
 
 
 class SubsSetupEmbedded(BaseMenuScreen):
@@ -2651,6 +2627,20 @@ class SubsChooserMenuList(MenuList):
             self.l.setList(menulist)
 
 
+def downloadMovieImages(details, title, releaseYear, imagesPath):
+    """Downloads poster, logo, backdrop and 4 cast pictures of a movie, returns a DeferredList."""
+    folder = os.path.join(imagesPath, "%s_%s" % (title, releaseYear))
+    castFolder = os.path.join(folder, "cast")
+    os.makedirs(castFolder, exist_ok=True)
+    poster = (details.get('additional_poster_urls') or [details.get('poster_url')])[0]
+    files = [(poster, "poster.jpg"), ((details.get('logo_urls') or [None])[0], "logo.png"),
+             ((details.get('backdrop_urls') or [None])[0], "backdrop.jpg")]
+    files += [(actor.get('profile_url'), os.path.join("cast", "cast_%d.jpg" % (i + 1))) for i, actor in enumerate(details.get('cast', [])[:4])]
+    downloads = [downloadPage(url, os.path.join(folder, name)).addErrback(lambda failure, url=url: print("[TMDB] %s: %s" % (url, failure.getErrorMessage())))
+                 for url, name in files if url]
+    return DeferredList(downloads)
+
+
 class TMDBScraperScreen(Screen):
     if isFullHD():
         skin = """
@@ -2723,7 +2713,6 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
         self.detailsPath = os.path.join(TMDBbackup_path, "details")
         self.imagesPath = os.path.join(TMDBbackup_path, "images")
         self.tmpPosterPath = "/var/volatile/tmp/subssupport_tmdb/"
-        self.backgroundTasksRunning = False
 
         # Create directories if they don't exist
         for path in [self.detailsPath, self.imagesPath, self.tmpPosterPath]:
@@ -2754,30 +2743,34 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
         self.posterUpdateTimer.callback.append(self.updateMovieListDelayed)
         self.posterUpdateTimerRunning = False
         self.posterUpdateQueue = []
+        self.onClose.append(self.posterUpdateTimer.stop)
+
+    def watch(self, d, callback, errback):
+        # the callbacks only run while the screen is open
+        self.onClose.append(d.cancel)
+        d.addCallbacks(callback, lambda failure: failure.check(CancelledError) or errback(failure))
 
     def startSearch(self):
         if self.currentSearch:
             self.searchTMDB()
 
     def searchTMDB(self):
-        try:
-            # Clear existing posters before new search
-            self.clearPosters()
-
-            self.movies = scrape_tmdb_movies(self.currentSearch)
+        def searchCB(movies):
+            self.movies = movies
             self.updateMovieList()
-
             if not self.movies:
-                # Instead of opening a MessageBox, show the error in the label
                 self["error_message"].setText(_("No results found for: %s") % self.currentSearch)
                 self["error_message"].show()
 
-        except Exception as e:
-            # Instead of opening a MessageBox, show the error in the label
-            error_msg = _("Error searching TMDB: %s") % str(e)
-            self["error_message"].setText(error_msg)
+        def searchError(failure):
+            print("[TMDB] search error: %s" % failure.getErrorMessage())
+            self["error_message"].setText(_("Error searching TMDB: %s") % failure.getErrorMessage())
             self["error_message"].show()
-            print(f"TMDB search error: {e}")
+
+        self.clearPosters()
+        self["error_message"].setText(_("Searching TMDB..."))
+        self["error_message"].show()
+        self.watch(search_movies(self.currentSearch), searchCB, searchError)
 
     def updateMovieList(self):
         self["error_message"].hide()
@@ -2815,10 +2808,7 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
             listItems.append((poster_pixmap, title, formatted_date, overview))
 
         self["list"].setList(listItems)
-
-        # Download all posters in background
-        if self.movies:
-            threading.Thread(target=self.downloadAllPosters).start()
+        self.downloadAllPosters()
 
     def updateMovieListDelayed(self):
         """Update the movie list with a delay to prevent flickering"""
@@ -2860,30 +2850,17 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
             print(f"Error clearing posters: {e}")
 
     def downloadAllPosters(self):
-        """Download all posters for the current search results"""
+        def posterCB(idx):
+            # eTimer only from the main thread
+            self.posterUpdateQueue.append(idx)
+            if not self.posterUpdateTimerRunning:
+                self.posterUpdateTimerRunning = True
+                self.posterUpdateTimer.start(200, True)
+
         for idx, movie in enumerate(self.movies):
-            poster_url = movie.get('poster_url')
-            if poster_url:
-                try:
-                    filename = f"poster_{idx}.jpg"
-                    filepath = os.path.join(self.tmpPosterPath, filename)
-
-                    # Download the poster (overwrite if exists)
-                    response = requests.get(poster_url, stream=True, verify=False, timeout=10)
-                    if response.status_code == 200:
-                        with open(filepath, 'wb') as out_file:
-                            shutil.copyfileobj(response.raw, out_file)
-
-                    # Add to update queue
-                    self.posterUpdateQueue.append(idx)
-
-                    # Start the timer if not running
-                    if not self.posterUpdateTimerRunning:
-                        self.posterUpdateTimerRunning = True
-                        self.posterUpdateTimer.start(200, True)
-
-                except Exception as e:
-                    print(f"Error downloading poster {idx}: {e}")
+            if movie.get('poster_url'):
+                filepath = os.path.join(self.tmpPosterPath, "poster_%d.jpg" % idx)
+                self.watch(downloadPage(movie['poster_url'], filepath), lambda result, idx=idx: posterCB(idx), lambda failure: None)
 
     def get_movie_year(self, movie):
         """Extract year from movie data"""
@@ -2904,23 +2881,15 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
         return 'unknown_year'
 
     def mergeMovieDetails(self, selected_movie, details, filepath=None):
-        """Merge the TMDB search card with scraped details and optionally persist it.
-
-        scrape_movie_details() intentionally returns page details only.  The search
-        card carries identity fields such as title, url, media_type and tmdb_id.
-        Always preserve both sets so every action writes the same complete JSON
-        structure.  This also repairs older partial JSON files when they are read.
-        """
+        """Merges the search result into the details, writes them when changed."""
         merged_info = {}
         if isinstance(selected_movie, dict):
             merged_info.update(selected_movie)
         if isinstance(details, dict):
             merged_info.update(details)
-
-        if filepath and merged_info:
+        if filepath and merged_info and (merged_info != details or not os.path.exists(filepath)):
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(merged_info, f, indent=2, ensure_ascii=False)
-
         return merged_info
 
     def selectMovie(self):
@@ -2937,11 +2906,8 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
                 filename = f"tmdb_{title}_{year}_details.json"
                 filepath = os.path.join(self.detailsPath, filename)
 
-                # Start background tasks and wait for them to complete
+                # details and images are fetched in a thread, the search does not need them
                 self.startBackgroundTasks(selected_movie, filepath, title, year)
-
-                # Wait for background tasks to complete before proceeding
-                self.waitForBackgroundTasks()
 
                 # Use the movie title and year for subtitle search
                 movie_title = selected_movie.get('title', '')
@@ -2957,17 +2923,6 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
                     self.close(search_title)
                 else:
                     self.session.open(MessageBox, _("Could not determine search title."), MessageBox.TYPE_INFO)
-
-    def waitForBackgroundTasks(self):
-        """Wait for background tasks to complete with a timeout"""
-        timeout = 10  # seconds
-        start_time = time.time()
-
-        while self.backgroundTasksRunning and (time.time() - start_time) < timeout:
-            time.sleep(0.1)  # Short sleep to avoid busy waiting
-
-        if self.backgroundTasksRunning:
-            print("Warning: Background tasks timed out")
 
     def startBackgroundTasks(self, selected_movie, filepath, title, year):
         """Start background tasks for scraping details and downloading images"""
@@ -2986,55 +2941,29 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
             self.session.open(MessageBox, _("Starting background tasks for details scraping and image download..."),
                              MessageBox.TYPE_INFO, timeout=3)
 
-        self.backgroundTasksRunning = True
-
-        # Start background thread for details scraping and image download
-        threading.Thread(target=self.backgroundTasksThread,
-                        args=(selected_movie, filepath, title, year, details_exist, images_exist)).start()
-
-    def backgroundTasksThread(self, selected_movie, filepath, title, year, details_exist, images_exist):
-        """Background thread for scraping details and downloading images"""
-        try:
-            # Set flag indicating tasks are running
-            self.backgroundTasksRunning = True
-
-            # Your existing code here...
-            details = None
-
-            # Only scrape details if they don't exist
-            if not details_exist:
-                # Fetch details and save to JSON file
-                details = scrape_movie_details(selected_movie['url'])
-                if details:
-                    # Save the same complete structure used by the OK path.
-                    details = self.mergeMovieDetails(selected_movie, details, filepath)
-                else:
-                    print("Failed to scrape movie details")
-                    return
-            else:
-                # Load existing details and repair older partial JSON files.
+        # keeps running after the screen is closed, so the callbacks use no widgets
+        if details_exist:
+            try:
                 with open(filepath, 'r', encoding='utf-8') as f:
-                    details = json.load(f)
-                details = self.mergeMovieDetails(selected_movie, details, filepath)
+                    d = succeed(json.load(f))
+            except Exception as e:
+                print("[TMDB] cannot read %s: %s" % (filepath, e))
+                return
+        else:
+            d = movie_details(selected_movie['url'])
+        merge, getYear, imagesPath = self.mergeMovieDetails, self.get_movie_year, self.imagesPath
 
-            # Download images if they don't exist
-            if not images_exist and details:
-                # Extract year from details
-                release_year = self.get_movie_year(details)
-                if release_year == 'unknown_year':
-                    release_year = year
-
-                if release_year != 'unknown_year':
-                    self.downloadImagesBackground(details, title, release_year)
-
-        except Exception as e:
-            print(f"Error in background tasks: {e}")
-            import traceback
-            traceback.print_exc()
-
-        finally:
-            # Clear flag when tasks are complete
-            self.backgroundTasksRunning = False
+        def gotDetails(details):
+            if not details:
+                print("[TMDB] no details for %s" % selected_movie.get('url'))
+                return
+            details = merge(selected_movie, details, filepath)
+            releaseYear = getYear(details)
+            if releaseYear == 'unknown_year':
+                releaseYear = year
+            if not images_exist and releaseYear != 'unknown_year':
+                return downloadMovieImages(details, title, releaseYear, imagesPath)
+        d.addCallback(gotDetails).addErrback(lambda failure: print("[TMDB] background task failed: %s" % failure.getErrorMessage()))
 
     def showDetails(self):
         if self["list"].getCurrent():
@@ -3063,16 +2992,16 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
                 else:
                     # Get detailed information
                     if 'url' in selected_movie:
-                        try:
-                            details = scrape_movie_details(selected_movie['url'])
+                        def detailsCB(details):
                             if details:
-                                # Merge search-result identity fields before saving.
                                 details = self.mergeMovieDetails(selected_movie, details, filepath)
                                 self.displayDetails(details, filepath)
                             else:
                                 self.session.open(MessageBox, _("Could not retrieve details for this movie."), MessageBox.TYPE_INFO)
-                        except Exception as e:
-                            self.session.open(MessageBox, _("Error retrieving details: %s") % str(e), MessageBox.TYPE_ERROR)
+
+                        def detailsError(failure):
+                            self.session.open(MessageBox, _("Error retrieving details: %s") % failure.getErrorMessage(), MessageBox.TYPE_ERROR)
+                        self.watch(movie_details(selected_movie['url']), detailsCB, detailsError)
                     else:
                         self.session.open(MessageBox, _("No URL available for this movie."), MessageBox.TYPE_INFO)
 
@@ -3104,75 +3033,13 @@ MultiContentEntryText(pos = (120, 90), size = (850, 50), font = 2, flags = RT_HA
                         if release_year != 'unknown_year':
                             # Start image download in background
                             self.session.open(MessageBox, _("Downloading images in background..."), MessageBox.TYPE_INFO, timeout=3)
-                            threading.Thread(target=self.downloadImagesBackground, args=(details, title, release_year)).start()
+                            downloadMovieImages(details, title, release_year, self.imagesPath)
                         else:
                             self.session.open(MessageBox, _("Cannot determine year for image folder."), MessageBox.TYPE_INFO)
                     except Exception as e:
                         self.session.open(MessageBox, _("Error loading details: %s") % str(e), MessageBox.TYPE_ERROR)
                 else:
                     self.session.open(MessageBox, _("No details available for this movie. Please view details first."), MessageBox.TYPE_INFO)
-
-    def downloadImagesBackground(self, details, title, release_year):
-        """Download images in the background without UI feedback"""
-        try:
-            # Use the instance's imagesPath
-            images_dir = self.imagesPath
-
-            # Create folder for this movie
-            folder_name = f"{title}_{release_year}"
-            movie_folder = os.path.join(images_dir, folder_name)
-            if not os.path.exists(movie_folder):
-                os.makedirs(movie_folder)
-
-            # Download poster
-            if details.get('additional_poster_urls'):
-                poster_url = details['additional_poster_urls'][0]
-                poster_path = os.path.join(movie_folder, "poster.jpg")
-                self.downloadImage(poster_url, poster_path)
-            elif details.get('poster_url'):
-                poster_url = details['poster_url']
-                poster_path = os.path.join(movie_folder, "poster.jpg")
-                self.downloadImage(poster_url, poster_path)
-
-            # Download logo
-            if details.get('logo_urls'):
-                logo_url = details['logo_urls'][0]
-                logo_path = os.path.join(movie_folder, "logo.png")
-                self.downloadImage(logo_url, logo_path)
-
-            # Download backdrop
-            if details.get('backdrop_urls'):
-                backdrop_url = details['backdrop_urls'][0]
-                backdrop_path = os.path.join(movie_folder, "backdrop.jpg")
-                self.downloadImage(backdrop_url, backdrop_path)
-
-            # Download cast images (limit to 4 to save time)
-            if details.get('cast'):
-                cast_folder = os.path.join(movie_folder, "cast")
-                if not os.path.exists(cast_folder):
-                    os.makedirs(cast_folder)
-
-                for i, actor in enumerate(details['cast'][:4]):
-                    if actor.get('profile_url'):
-                        cast_path = os.path.join(cast_folder, f"cast_{i + 1}.jpg")
-                        self.downloadImage(actor['profile_url'], cast_path)
-
-            print(f"Background image download completed for {title}_{release_year}")
-
-        except Exception as e:
-            print(f"Error downloading images in background: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def downloadImage(self, url, path):
-        """Download a single image"""
-        try:
-            response = requests.get(url, stream=True, verify=False, timeout=10)
-            if response.status_code == 200:
-                with open(path, 'wb') as out_file:
-                    shutil.copyfileobj(response.raw, out_file)
-        except Exception as e:
-            print(f"Error downloading image {url}: {e}")
 
     def displayDetails(self, details, filepath):
         # Extract year from details
@@ -3729,11 +3596,6 @@ class SubsDownloadedSubtitlesMenu(BaseMenuScreen):
         menuList.append(getConfigListEntry(_("Ask on remove action"), self.historySettings.removeActionAsk))
         self["config"].setList(menuList)
 
-    def keyOK(self):
-        if self["config"].getCurrent()[1] == self.historySettings.path:
-            self.session.openWithCallback(self.changeDir, LocationBox,
-                 _("Select Directory"), currDir=self.historySettings.path.value)
-
 # source from openpli
 
 
@@ -3836,93 +3698,55 @@ class SubsSearchProcess(object):
 
     def __init__(self):
         self.log = SimpleLogger('SubsSearchProcess', SimpleLogger.LOG_INFO)
-        self.toRead = None
-        self.pPayload = None
         self.data = ""
         self.__stopping = False
-        self.mpart = False
         self.appContainer = eConsoleAppContainer()
         self.stdoutAvail_conn = eConnectCallback(self.appContainer.stdoutAvail, self.dataOutCB)
         self.stderrAvail_conn = eConnectCallback(self.appContainer.stderrAvail, self.dataErrCB)
         self.appContainer_conn = eConnectCallback(self.appContainer.appClosed, self.finishedCB)
 
     def recieveMessages(self, data):
+        # "%07d" size (header included) + ASCII JSON, see searchsubs.send()
         if isinstance(data, bytes):
             data = data.decode("utf-8", "ignore")
-        elif not isinstance(data, str):
-            data = str(data)
-
         self.data += data
-
-        while True:
-            if len(self.data) < 7:
-                return
-
-            header = self.data[:7]
+        while len(self.data) >= 7:
             try:
-                messageSize = int(header)
-            except Exception:
-                self.log.error("invalid process-message header: %r", header)
-                self.data = ""
-                return
-
+                messageSize = int(self.data[:7])
+            except ValueError:
+                messageSize = 0
             if messageSize < 7:
-                self.log.error("invalid process-message size: %r", messageSize)
+                self.log.error("invalid process-message header: %r", self.data[:7])
                 self.data = ""
                 return
-
             if len(self.data) < messageSize:
                 return
-
             payload = self.data[7:messageSize]
             self.data = self.data[messageSize:]
-
             try:
-                message = json.loads(payload)
+                self.handleMessage(json.loads(payload))
             except Exception as e:
-                self.log.error("invalid process-message JSON: %s", str(e))
-                continue
-
-            try:
-                self.handleMessage(message)
-            except Exception as e:
-                # A screen callback failure must not corrupt the framing buffer or
-                # trigger the old unsafe fallback parser.
-                self.log.error("process callback failed: %s", str(e))
+                self.log.error("process message failed: %s", str(e))
                 traceback.print_exc()
 
     def handleMessage(self, data):
         self.log.debug('handleMessage "%s"', data)
-
-        def _unwrap(value):
-            # searchsubs.py sends callback params as *args -> packed into a 1-item list/tuple
-            # Example for chooseFileCB: value == [subFiles]
-            if isinstance(value, (list, tuple)) and len(value) == 1:
-                return value[0]
-            return value
-
-        if data['message'] == Messages.MESSAGE_UPDATE_CALLBACK:
+        message = data['message']
+        if message == Messages.MESSAGE_UPDATE_CALLBACK:
             self.callbacks['updateCB'](data['value'])
-
-        if data['message'] == Messages.MESSAGE_OVERWRITE_CALLBACK:
-            self.callbacks['overwriteCB'](_unwrap(data['value']), self.write)
-
-        if data['message'] == Messages.MESSAGE_CHOOSE_FILE_CALLBACK:
-            self.callbacks['choosefileCB'](_unwrap(data['value']), self.write)
-
-        if data['message'] == Messages.MESSAGE_CAPTCHA_CALLBACK:
-            self.callbacks['captchaCB'](_unwrap(data['value']), self.write)
-
-        if data['message'] == Messages.MESSAGE_DELAY_CALLBACK:
-            self.callbacks['delayCB'](_unwrap(data['value']), self.write)
-
-        if data['message'] == Messages.MESSAGE_FINISHED_SCRIPT:
+        elif message == Messages.MESSAGE_OVERWRITE_CALLBACK:
+            self.callbacks['overwriteCB'](data['value'], self.write)
+        elif message == Messages.MESSAGE_CHOOSE_FILE_CALLBACK:
+            self.callbacks['choosefileCB'](data['value'], self.write)
+        elif message == Messages.MESSAGE_CAPTCHA_CALLBACK:
+            self.callbacks['captchaCB'](data['value'], self.write)
+        elif message == Messages.MESSAGE_DELAY_CALLBACK:
+            self.callbacks['delayCB'](data['value'], self.write)
+        elif message == Messages.MESSAGE_FINISHED_SCRIPT:
             self.callbacks['successCB'](data['value'])
-
-        if data['message'] == Messages.MESSAGE_CANCELLED_SCRIPT:
+        elif message == Messages.MESSAGE_CANCELLED_SCRIPT:
             print('script successfully cancelled')
-
-        if data['message'] == Messages.MESSAGE_ERROR_SCRIPT:
+        elif message == Messages.MESSAGE_ERROR_SCRIPT:
             self.callbacks['errorCB'](data['value'])
 
     def start(self, params, callbacks):
@@ -3974,10 +3798,9 @@ class SubsSearchProcess(object):
         dump = json.dumps(data)
         dump = "%07d%s" % (len(dump), dump)
         try:
-            self.appContainer.write(dump)
-        # DMM image
-        except TypeError:
             self.appContainer.write(dump, len(dump))
+        except TypeError:
+            self.appContainer.write(dump)
 
     def dataErrCB(self, data):
         self.log.debug("dataErrCB: '%s'", data)
@@ -4020,221 +3843,98 @@ class Suggestions(object):
             failure.printTraceback()
             self.errorCB(failure)
 
-    def _getSuggestions(self):
+    def _getSuggestions(self, queryString):
         return Deferred()
 
     def _processResult(self, data):
         return data
 
 
-class OpenSubtitlesSuggestions(Suggestions):
-    API_URL = "https://api.opensubtitles.com/api/v1/subtitles"
+class WebSuggestions(Suggestions):
+    # provider, enabled state and API key are checked in ConfigTextWithSuggestionsAndHistory.getSuggestions
     MIN_QUERY_LENGTH = 2
     MAX_SUGGESTIONS = 20
 
-    def __init__(self, suggestionsCfg=None):
+    def __init__(self, suggestionsCfg):
         Suggestions.__init__(self)
         self.suggestionsCfg = suggestionsCfg
 
-    def _isEnabled(self):
-        try:
-            return bool(
-                self.suggestionsCfg.enabled.value
-                and self.suggestionsCfg.provider.value == "opensubtitles"
-                and self.suggestionsCfg.apiKey.value.strip()
-            )
-        except Exception:
-            return False
-
-    def _emptyResult(self):
-        d = Deferred()
-        d.callback(b'{"data": []}')
-        return d
-
     def _getSuggestions(self, queryString):
         queryString = (queryString or "").strip()
-        if not self._isEnabled() or len(queryString) < self.MIN_QUERY_LENGTH:
-            return self._emptyResult()
+        if len(queryString) < self.MIN_QUERY_LENGTH:
+            d = Deferred()
+            d.callback(None)
+            return d
+        url, params, headers = self._request(queryString)
+        headers.update({"User-Agent": "SubsSupport/%s" % __version__, "Accept": "application/json"})
 
-        apiKey = self.suggestionsCfg.apiKey.value.strip()
-
-        # The existing opensubtitles.com seeker already uses requests successfully.
-        # Keep the GUI responsive by executing the HTTP request in a Twisted worker thread.
-        def fetch():
-            response = requests.get(
-                self.API_URL,
-                params={"query": queryString},
-                headers={
-                    "Api-Key": apiKey,
-                    "User-Agent": "SubsSupport/%s" % __version__,
-                    "Accept": "application/json",
-                },
-                timeout=6
-            )
-            response.raise_for_status()
-            return response.content
-
-        return threads.deferToThread(fetch)
+        def parse(body):
+            try:
+                return json.loads(body)
+            except ValueError:
+                print("[%s] non-JSON response received" % self)
+        return fetch(url, params, headers, timeout=6).addCallback(parse)
 
     def _processResult(self, data):
-        if isinstance(data, bytes):
-            data = data.decode("utf-8", "replace")
-
-        if not data.lstrip().startswith(("{", "[")):
-            print("[OpenSubtitlesSuggestions] non-JSON response received")
+        if not isinstance(data, dict):
             return []
+        return self._parse(data)[:self.MAX_SUGGESTIONS]
 
-        try:
-            payload = json.loads(data)
-        except Exception as e:
-            print("[OpenSubtitlesSuggestions] invalid JSON response:", e)
-            return []
 
-        if not isinstance(payload, dict):
-            return []
+class OpenSubtitlesSuggestions(WebSuggestions):
+    API_URL = "https://api.opensubtitles.com/api/v1/subtitles"
 
+    def _request(self, queryString):
+        return self.API_URL, {"query": queryString}, {"Api-Key": self.suggestionsCfg.apiKey.value.strip()}
+
+    def _parse(self, payload):
         titles = {}
         for item in payload.get("data", []):
             attributes = item.get("attributes", {}) or {}
             feature = attributes.get("feature_details", {}) or {}
-            name = (
-                feature.get("parent_title")
-                or feature.get("title")
-                or feature.get("movie_name")
-                or attributes.get("release")
-            )
+            name = str(feature.get("parent_title") or feature.get("title") or feature.get("movie_name") or "").strip()
             if not name:
                 continue
-
-            name = str(name).strip()
-            if not name:
-                continue
-
             try:
                 total = int(attributes.get("download_count", 0) or 0)
             except Exception:
                 total = 0
-
-            # REST search returns subtitles, not distinct titles. Collapse duplicates.
+            # the search returns subtitles, not titles, collapse duplicates
             key = name.lower()
-            previous = titles.get(key)
-            if previous is None or total > previous["total"]:
+            if key not in titles or total > titles[key]["total"]:
                 titles[key] = {"name": name, "total": total}
-
-        result = list(titles.values())
-        result.sort(key=lambda x: int(x.get("total", 0)), reverse=True)
-        return result[:self.MAX_SUGGESTIONS]
+        return sorted(titles.values(), key=lambda x: x["total"], reverse=True)
 
 
-class IMDbSuggestions(Suggestions):
+class IMDbSuggestions(WebSuggestions):
     API_URL = "https://v3.sg.media-imdb.com/suggestion/x/%s.json"
-    MIN_QUERY_LENGTH = 2
-    MAX_SUGGESTIONS = 20
-
-    # Keep title-like IMDb entities and ignore people, companies and keywords.
     ALLOWED_TITLE_TYPES = {
         "movie", "tvMovie", "tvSeries", "tvMiniSeries", "tvSpecial",
         "tvEpisode", "short", "video"
     }
 
-    def __init__(self, suggestionsCfg=None):
-        Suggestions.__init__(self)
-        self.suggestionsCfg = suggestionsCfg
+    def _request(self, queryString):
+        return self.API_URL % quote(queryString.lower(), safe=""), None, {}
 
-    def _isEnabled(self):
-        try:
-            return bool(
-                self.suggestionsCfg.enabled.value
-                and self.suggestionsCfg.provider.value == "imdb"
-            )
-        except Exception:
-            return False
-
-    def _emptyResult(self):
-        d = Deferred()
-        d.callback(b'{"d": []}')
-        return d
-
-    def _getSuggestions(self, queryString):
-        queryString = (queryString or "").strip()
-        if not self._isEnabled() or len(queryString) < self.MIN_QUERY_LENGTH:
-            return self._emptyResult()
-
-        # IMDb serves lightweight suggestion JSON files from a CDN.  This is an
-        # undocumented endpoint, so failures must remain silent and harmless.
-        url = self.API_URL % quote(queryString.lower(), safe="")
-
-        def fetch():
-            response = requests.get(
-                url,
-                headers={
-                    "User-Agent": "SubsSupport/%s" % __version__,
-                    "Accept": "application/json",
-                },
-                timeout=6
-            )
-            response.raise_for_status()
-            return response.content
-
-        return threads.deferToThread(fetch)
-
-    def _processResult(self, data):
-        if isinstance(data, bytes):
-            data = data.decode("utf-8", "replace")
-
-        if not data.lstrip().startswith(("{", "[")):
-            print("[IMDbSuggestions] non-JSON response received")
-            return []
-
-        try:
-            payload = json.loads(data)
-        except Exception as e:
-            print("[IMDbSuggestions] invalid JSON response:", e)
-            return []
-
-        if not isinstance(payload, dict):
-            return []
-
-        raw_items = payload.get("d", []) or []
+    def _parse(self, payload):
+        items = payload.get("d", []) or []
         suggestions = []
         seen = set()
-
-        for index, item in enumerate(raw_items):
+        for index, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
-
-            imdb_id = str(item.get("id") or "")
-            title_type = str(item.get("qid") or "")
+            imdbId = str(item.get("id") or "")
+            titleType = str(item.get("qid") or "")
             title = str(item.get("l") or "").strip()
-
-            # IMDb title IDs begin with "tt".  qid is normally present, but
-            # allow a title record without qid so minor CDN schema changes do
-            # not unnecessarily hide valid titles.
-            if not imdb_id.startswith("tt") or not title:
+            if not imdbId.startswith("tt") or not title or (titleType and titleType not in self.ALLOWED_TITLE_TYPES):
                 continue
-            if title_type and title_type not in self.ALLOWED_TITLE_TYPES:
-                continue
-
             year = item.get("y")
-            display_name = title
-            if year not in (None, ""):
-                display_name = "%s (%s)" % (title, str(year))
-
-            key = display_name.lower()
-            if key in seen:
+            name = "%s (%s)" % (title, year) if year else title
+            if name.lower() in seen:
                 continue
-            seen.add(key)
-
-            # IMDb already ranks the CDN array.  Preserve that ordering while
-            # returning the same {name, total} structure used by the GUI.
-            suggestions.append({
-                "name": display_name,
-                "total": max(len(raw_items) - index, 1)
-            })
-
-            if len(suggestions) >= self.MAX_SUGGESTIONS:
-                break
-
+            seen.add(name.lower())
+            # keep the IMDb order, the year is shown but not used as search title
+            suggestions.append({"name": name, "title": title, "total": len(items) - index})
         return suggestions
 
 
@@ -4300,11 +4000,12 @@ class BaseSuggestionsListScreen(Screen):
             suggestions.reverse()
             self.list = []
             for s in suggestions:
-                self.list.append((s['name'],))
+                self.list.append((s['name'], s.get('title', s['name'])))
             self["suggestionslist"].setList(self.list)
             self["suggestionslist"].setIndex(0)
-            print(suggestions)
         else:
+            self.list = []
+            self["suggestionslist"].setList(self.list)
             self.hide()
 
     def getlistlenght(self):
@@ -4341,7 +4042,7 @@ class BaseSuggestionsListScreen(Screen):
     def getSelection(self):
         if not self["suggestionslist"].getCurrent():
             return None
-        return self["suggestionslist"].getCurrent()[0]
+        return self["suggestionslist"].getCurrent()[1]
 
     def enableSelection(self, value):
         if value:
@@ -4507,29 +4208,16 @@ class ConfigTextWithSuggestionsAndHistory(ConfigText):
     def getSuggestions(self):
         self.cancelGetSuggestions()
         self.__suggestions = None
-        try:
-            enabled = self.suggestionsCfg.enabled.value
-            provider = self.suggestionsCfg.provider.value
-            apiKey = self.suggestionsCfg.apiKey.value.strip()
-        except Exception:
-            enabled = False
-            provider = ""
-            apiKey = ""
-
-        # IMDb suggestions need no key.  OpenSubtitles suggestions are enabled
-        # only when their dedicated API key has been entered.
-        if not enabled or (provider == "opensubtitles" and not apiKey):
-            if self.suggestionsWindow:
-                self.suggestionsWindow.update([])
-            return
-
-        suggestionsClass = self.suggestionsClasses.get(provider)
+        suggestionsClass = None
+        cfg = self.suggestionsCfg
+        # OpenSubtitles needs an API key, IMDb does not
+        if cfg is not None and cfg.enabled.value and (cfg.provider.value != "opensubtitles" or cfg.apiKey.value.strip()):
+            suggestionsClass = self.suggestionsClasses.get(cfg.provider.value)
         if suggestionsClass is None:
             if self.suggestionsWindow:
                 self.suggestionsWindow.update([])
             return
-
-        self.__suggestions = suggestionsClass(self.suggestionsCfg)
+        self.__suggestions = suggestionsClass(cfg)
         self.__suggestions.getSuggestions(self.value, self.propagateSuggestions, self.gotSuggestionsError)
 
     def getHistory(self):
@@ -4969,7 +4657,7 @@ class SubsSearch(Screen):
         self.posterRefreshTimer = eTimer()
         self.posterRefreshTimer.callback.append(self.refreshPosterPeriodically)
         self.posterRefreshCount = 0
-        self.maxPosterRefreshAttempts = 5  # Try for 15 seconds (5 attempts × 3 seconds)
+        self.maxPosterRefreshAttempts = 5
         self.__downloadedSubtitles = []
         self.__downloading = False
         self.__searching = False
@@ -5390,11 +5078,7 @@ class SubsSearch(Screen):
             choiceList = [(os.path.basename(subfile), subfile) for subfile in subFiles]
 
             def _selected(choice):
-                # ChoiceBox returns: (display, value) or None
-                if choice is None:
-                    resultCB(None)
-                else:
-                    resultCB(choice[1])  # send ONLY the filepath (string) back to searchsubs.py
+                resultCB(choice and choice[1])  # the path only
 
             self.session.openWithCallback(_selected, ChoiceBox, choiceTitle, choiceList)
 
@@ -5421,6 +5105,13 @@ class SubsSearch(Screen):
 
     def downloadSubsSuccess(self, subFile):
         print('[SubsSearch] download success %s' % subFile)
+        if subFile is None:  # file choice cancelled
+            self.message.hide()
+            self.__downloading = False
+            del self.__downloadingSubtitle
+            self.updateBottomMenu()
+            self.updateActionMaps()
+            return
         dsubtitle = {
             "name": toUnicode(os.path.basename(subFile)),
             "country": toUnicode(self.__downloadingSubtitle['country']),
@@ -5472,9 +5163,9 @@ class SubsSearch(Screen):
         if e['error_code'] == SubtitlesErrors.CAPTCHA_RETYPE_ERROR:
             self.message.error(errorMessageFormat.format(e['provider'], _("captcha doesn't match, try again...")), 4000)
         elif e['error_code'] == SubtitlesErrors.INVALID_CREDENTIALS_ERROR:
-            self.message.error(errorMessageFormat.format(e.provider, _("invalid credentials provided, correct them and try again")), 4000)
+            self.message.error(errorMessageFormat.format(e['provider'], _("invalid credentials provided, correct them and try again")), 4000)
         elif e['error_code'] == SubtitlesErrors.NO_CREDENTIALS_ERROR:
-            self.message.error(errorMessageFormat.format(e.provider, _("no credentials provided, set them and try again")), 4000)
+            self.message.error(errorMessageFormat.format(e['provider'], _("no credentials provided, set them and try again")), 4000)
         else:
             self.message.error(_("download error ocurred, for details see /tmp/subssearch.log"), 4000)
 
@@ -5639,7 +5330,6 @@ class SubsSearch(Screen):
 
         except Exception as e:
             print(f"[SubsSearch] Error in updatePoster: {e}")
-            import traceback
             traceback.print_exc()
             self.showDefaultPoster()
             self.startPosterRefreshTimer()
@@ -5949,6 +5639,8 @@ class SubsSearchSettings(Screen, ConfigListScreen):
                                                     self.searchSettings.lang2,
                                                     self.searchSettings.lang3]:
                 self.session.openWithCallback(self.setLanguage, MyLanguageSelection, current.value)
+            elif current == self.searchSettings.suggestions.apiKey:
+                self.keyText()
 
     def setLanguage(self, language=None):
         if language:
@@ -5974,22 +5666,20 @@ class SubsSearchSettings(Screen, ConfigListScreen):
         langChanged = (self.searchSettings.lang1.isChanged() or
                             self.searchSettings.lang2.isChanged() or
                             self.searchSettings.lang3.isChanged())
-        for x in self["config"].list:
-            x[1].save()
-        # Save nested suggestion values even when the API-key row is currently hidden.
-        self.searchSettings.suggestions.enabled.save()
-        self.searchSettings.suggestions.provider.save()
-        self.searchSettings.suggestions.apiKey.save()
+        for x in self.configElements():
+            x.save()
         self.close(langChanged)
 
     def keyCancel(self):
-        for x in self["config"].list:
-            x[1].cancel()
-        # Cancel nested suggestion values even when the API-key row is currently hidden.
-        self.searchSettings.suggestions.enabled.cancel()
-        self.searchSettings.suggestions.provider.cancel()
-        self.searchSettings.suggestions.apiKey.cancel()
+        for x in self.configElements():
+            x.cancel()
         self.close()
+
+    def configElements(self):
+        # includes the suggestion rows, which may be hidden
+        elements = [x[1] for x in self["config"].list]
+        suggestions = self.searchSettings.suggestions
+        return elements + [x for x in (suggestions.provider, suggestions.apiKey) if x not in elements]
 
     def keyUp(self):
         if self.focus == self.FOCUS_CONFIG:
@@ -6081,7 +5771,7 @@ class SubsSearchParamsMenu(Screen, ConfigListScreen):
         configItemHeight = configFont + 10
         blueKeyFont = 20 * ratio
         blueKeySize = (xFullSize, blueKeyFont + 10)
-        blueKeyBarSize = (xFullSize, 3 * ratio)
+        blueKeyBarSize = (xFullSize if titleList and len(titleList) > 1 else 0, 3 * ratio)  # no bar without blue key
 
         windowPos = (desktopSize[0] / 2 - windowSize[0] / 2, desktopSize[1] / 5 * 3 - windowSize[1] / 2)
 
@@ -6128,7 +5818,7 @@ class SubsSearchParamsMenu(Screen, ConfigListScreen):
         else:
             self['sourceTitleInfo'] = StaticText("%s [%d/%d]" % (_("Source title"), 1, len(self.sourceTitleList)))
         self['sourceTitle'] = StaticText(self.sourceTitle)
-        self['key_blue'] = StaticText(_("Next source title") if len(self.sourceTitleList) > 0 else "")
+        self['key_blue'] = StaticText(_("Next source title") if len(self.sourceTitleList) > 1 else "")
         self["suggestionActions"] = ActionMap(["OkCancelActions", "ColorActions", "DirectionActions"],
             {
                  "ok": self.switchToConfigList,

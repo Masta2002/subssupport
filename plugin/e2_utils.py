@@ -16,46 +16,79 @@
 #
 #################################################################################
 from . import _
+from io import BytesIO
 import os
-import shutil
-import requests
-from twisted.internet.threads import deferToThread
+from urllib.parse import urlencode
+from twisted.internet import reactor
+from twisted.web.client import Agent, BrowserLikePolicyForHTTPS, BrowserLikeRedirectAgent, FileBodyProducer, PartialDownloadError, readBody
+from twisted.web.http_headers import Headers
 from xml.etree.ElementTree import parse as parse_xml
 from Components.Label import Label
 from Components.ConfigList import ConfigList
 from Components.Sources.StaticText import StaticText
 from Components.ActionMap import ActionMap
-from Components.ConfigList import ConfigList
-from Components.Console import Console
 from Components.Language import language
 from Components.Pixmap import Pixmap
 from Components.Sources.Boolean import Boolean
 from Components.Sources.List import List
-from Components.Sources.StaticText import StaticText
 from Components.ConfigList import ConfigListScreen
 from Components.config import ConfigText, ConfigSubsection, ConfigDirectory, \
     ConfigYesNo, ConfigPassword, getConfigListEntry, configfile
 from Screens.MessageBox import MessageBox
 from Screens.Screen import Screen
 from Screens.VirtualKeyBoard import VirtualKeyBoard
-from Tools.Directories import pathExists, fileExists, SCOPE_SKIN, SCOPE_CURRENT_SKIN, resolveFilename
-from Components.ActionMap import NumberActionMap, ActionMap, HelpableActionMap
-from Components.config import ConfigText, KEY_0, KEY_DELETE, KEY_BACKSPACE, config
-from enigma import addFont, eEnv, ePicLoad, getDesktop, eListboxPythonMultiContent, eListbox, eTimer, gFont, RT_HALIGN_LEFT, RT_HALIGN_RIGHT, RT_HALIGN_CENTER, RT_WRAP, loadPNG
+from Tools.Directories import fileExists, SCOPE_SKIN, SCOPE_CURRENT_SKIN, resolveFilename
+from enigma import addFont, eEnv, ePicLoad, getDesktop
 
 from .compat import eConnectCallback
 from Tools.LoadPixmap import LoadPixmap
 
 
-def downloadPage(url, filename, params=None, headers=None, cookies=None):
-    return getPage(url, params, headers, cookies)
+HTTP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0"
 
 
-def getPage(url, params=None, headers=None, cookies=None, timeout=None):
-    headers = headers or {}
-    timeout = timeout or 30.05
-    headers["user-agent"] = "Mozilla/5.0 Gecko/20100101 Firefox/100.0"
-    return deferToThread(requests.get, url, params=params, headers=headers, cookies=cookies, timeout=timeout)
+class HTTPError(Exception):
+    def __init__(self, code, url):
+        Exception.__init__(self, "HTTP %d: %s" % (code, url))
+        self.code = code
+
+
+def fetch(url, params=None, headers=None, data=None, timeout=15):
+    """Non-blocking GET (POST when data is given) with twisted, returns a Deferred firing with the body (bytes)."""
+    if params:
+        url += ("&" if "?" in url else "?") + urlencode(params)
+    allHeaders = {"User-Agent": HTTP_USER_AGENT, "Accept": "*/*"}
+    allHeaders.update(headers or {})
+    agent = BrowserLikeRedirectAgent(Agent(reactor, contextFactory=BrowserLikePolicyForHTTPS(), connectTimeout=timeout))
+    body = None
+    if data is not None:
+        body = FileBodyProducer(BytesIO(data if isinstance(data, bytes) else data.encode("utf-8")))
+    d = agent.request(b"GET" if body is None else b"POST", url.encode("utf-8"),
+                      Headers(dict((k.encode("utf-8"), [v.encode("utf-8")]) for k, v in allHeaders.items())), body)
+
+    def partial(failure):  # a body without Content-Length ends with a PartialDownloadError
+        failure.trap(PartialDownloadError)
+        return failure.value.response
+
+    def gotResponse(response):
+        def checkCode(content):
+            if not 200 <= response.code < 300:
+                raise HTTPError(response.code, url)
+            return content
+        return readBody(response).addErrback(partial).addCallback(checkCode)
+    d.addCallback(gotResponse)
+    d.addTimeout(timeout, reactor)
+    return d
+
+
+def downloadPage(url, filename, params=None, headers=None, timeout=15):
+    """fetch() into a file, returns a Deferred firing with the filename."""
+    def save(content):
+        with open(filename, "wb") as f:
+            f.write(content)
+        return filename
+    return fetch(url, params, headers, timeout=timeout).addCallback(save)
+
 
 def getDesktopSize():
     s = getDesktop(0).size()
@@ -251,68 +284,40 @@ class Captcha(object):
         self.captchaCB('')
 
 
-class CaptchaDialog(VirtualKeyBoard):
+class CaptchaDialog(Screen):
+    # shows the captcha picture above the image's own virtual keyboard, closes with the typed text (None on cancel)
     skin = """
-    <screen name="CaptchDialog" position="center,center" size="560,485" zPosition="99" title="Virtual keyboard" resolution="1280,720">
-        <ePixmap pixmap="skin_default/vkey_text.png" position="9,165" zPosition="-4" size="542,52" alphatest="on" />
-        <widget source="country" render="Pixmap" position="490,0" size="60,40" alphatest="on" borderWidth="2" borderColor="yellow" >
-            <convert type="ValueToPixmap">LanguageCode</convert>
-        </widget>
-        <widget name="header" position="10,10" size="500,20" font="Regular;20" transparent="1" noWrap="1" />
-        <widget position="10,455" size="60,35" name="Green" pixmap="skin_default/buttons/key_green.png" zPosition="3"  alphatest="blend" />
-        <eLabel text="Save" zPosition="3" position="50,450" size="120,35" font="Regular;20" transparent="1" backgroundColor="black" halign="center" valign="center" />
-        <widget name="captcha" position="10, 50" size ="540,110" alphatest="blend" zPosition="-1" />
-        <widget name="text" position="12,165" size="536,46" font="Regular;46" transparent="1" noWrap="1" halign="right" />
-        <widget name="list" position="10,220" size="540,225" selectionDisabled="1" transparent="1" />
-    </screen>
-    """
+        <screen name="SubsSupportCaptcha" position="center,40" size="560,130" flags="wfNoBorder" zPosition="99" resolution="1280,720">
+            <widget name="captcha" position="10,10" size="540,110" alphatest="blend" />
+        </screen>"""
 
-    def __init__(self, session, captcha_file, **kwargs):
-        VirtualKeyBoard.__init__(self, session, _('Type text of picture'))
+    def __init__(self, session, captchaFile):
+        Screen.__init__(self, session)
         self["captcha"] = Pixmap()
-        self['Password'] = Label()
-        self['Green'] = Pixmap()
-        self['key_green'] = StaticText(_('Save'))
-        self["text"] = self['text']
-        self["myActionMap"] = NumberActionMap(["WizardActions", "InputBoxActions", "ColorActions"], {
-            "green": self.save
-        }, -1)
-        self.picPath = captcha_file
+        self.captchaFile = captchaFile
         self.picLoad = ePicLoad()
-        self.picLoad_conn = eConnectCallback(self.picLoad.PictureData, self.decodePicture)
-        self.onLayoutFinish.append(self.showPicture)
+        self.picLoad_conn = eConnectCallback(self.picLoad.PictureData, self.showPicture)
+        self.onLayoutFinish.append(self.decodePicture)
+        self.onShown.append(self.openKeyboard)
         self.onClose.append(self.__onClose)
 
-    def showPicture(self):
-        self.picLoad.setPara([self["captcha"].instance.size().width(), self["captcha"].instance.size().height(), 1, 1, 0, 1, "#002C2C39"])
-        self.picLoad.startDecode(self.picPath)
+    def decodePicture(self):
+        size = self["captcha"].instance.size()
+        self.picLoad.setPara([size.width(), size.height(), 1, 1, 0, 1, "#002C2C39"])
+        self.picLoad.startDecode(self.captchaFile)
 
-    def decodePicture(self, PicInfo=""):
-        ptr = self.picLoad.getData()
-        self["captcha"].instance.setPixmap(ptr)
-
-    def showPic(self, picInfo=""):
+    def showPicture(self, picInfo=""):
         ptr = self.picLoad.getData()
         if ptr is not None:
-            self["captcha"].instance.setPixmap(ptr.__deref__())
-            self["captcha"].show()
+            self["captcha"].instance.setPixmap(ptr)
+
+    def openKeyboard(self):
+        self.onShown.remove(self.openKeyboard)
+        self.session.openWithCallback(self.close, VirtualKeyBoard, title=_("Type text of picture"))
 
     def __onClose(self):
         del self.picLoad_conn
         del self.picLoad
-
-    def save(self):
-        Password = self['text'].getText()
-        code = str(Password)
-        #with open(LINKFILE, "a") as f: f.write(Password)
-        Distnt = '/tmp/'
-        Path = '/tmp/code'
-        if pathExists(Distnt):
-            Password = self['text'].getText()
-            if Password != '':
-                file = open(Path, 'w')
-                file.write(Password.replace(' ', ''))
-                file.close()
 
 
 class DelayMessageBox(MessageBox):
@@ -441,30 +446,21 @@ def getFonts():
     if len(FONTS) > 0:
         return FONTS.keys()
 
-    allFonts = []
-
-    # 1) System fonts (existing logic)
+    fontExts = (".ttf", ".otf")
     fontDir = eEnv.resolve("${datadir}/fonts/")
+    pluginFontDir = os.path.join(os.path.dirname(__file__), "fonts", "")
     print('[getFonts] fontDir: %s' % fontDir)
-
-    if os.path.isdir(fontDir):
-        for font in os.listdir(fontDir):
-            fontPath = os.path.join(fontDir, font)
+    allFonts = []
+    for directory in (fontDir, pluginFontDir):
+        if not os.path.isdir(directory):
+            continue
+        for font in os.listdir(directory):
+            fontPath = os.path.join(directory, font)
             if os.path.isdir(fontPath):
-                for f in os.listdir(fontPath):
-                    if f.lower().endswith(".ttf"):
-                        allFonts.append(os.path.join(fontPath, f))
-            elif fontPath.lower().endswith(".ttf"):
+                allFonts.extend(os.path.join(fontPath, f) for f in os.listdir(fontPath) if f.lower().endswith(fontExts))
+            elif font.lower().endswith(fontExts):
                 allFonts.append(fontPath)
 
-    # 2) Plugin fonts (SubsSupport only) -> register with prefix to avoid clashes
-    pluginFontDir = os.path.join(os.path.dirname(__file__), "fonts", "")
-    if os.path.isdir(pluginFontDir):
-        for f in os.listdir(pluginFontDir):
-            if f.lower().endswith((".ttf", ".otf")):
-                allFonts.append(os.path.join(pluginFontDir, f))
-
-    # Skin font name mapping (existing logic)
     skinFiles = ["skin_default.xml", "skin_subtitles.xml", "skin_user.xml"]
     fonts = {}
     for skinFile in skinFiles:
@@ -483,25 +479,16 @@ def getFonts():
                     fonts[filename] = name
                     print('[getFonts] find font %s in %s' % (name, skinFile))
 
-    # Register fonts
     for fontFilepath in allFonts:
         fontFilename = os.path.basename(fontFilepath)
-
-        # If font comes from plugin folder -> force prefixed name
+        fontName = os.path.splitext(fontFilename)[0]
         if fontFilepath.startswith(pluginFontDir):
-            base = os.path.splitext(fontFilename)[0]
-            fontName = "SS_" + base
-            addFont(fontFilepath, fontName, 100, False)
-            FONTS[fontName] = fontFilepath
-            continue
-
-        # Existing behavior for system fonts
-        if fontFilename not in fonts.keys():
-            fontName = os.path.splitext(fontFilename)[0]
-            addFont(fontFilepath, fontName, 100, False)
-            FONTS[fontName] = fontFilepath
-        else:
+            fontName = "SS_" + fontName  # plugin fonts, avoid clashes with system/skin fonts
+        elif fontFilename in fonts:
             FONTS[fonts[fontFilename]] = fontFilename
+            continue
+        addFont(fontFilepath, fontName, 100, False)
+        FONTS[fontName] = fontFilepath
 
     if "Regular" not in FONTS:
         FONTS["Regular"] = ""
@@ -511,9 +498,9 @@ def getFonts():
 
 class BaseMenuScreen(Screen, ConfigListScreen):
 
-    def __init__(self, session, title):
+    def __init__(self, session, title, on_change=None):
         Screen.__init__(self, session)
-        ConfigListScreen.__init__(self, [], session=session)
+        ConfigListScreen.__init__(self, [], session=session, on_change=on_change)
         self.skinName = "Setup"
         self["actions"] = ActionMap(["SetupActions", "ColorActions"],
             {

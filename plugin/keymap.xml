@@ -24,15 +24,12 @@
 		<key id="KEY_PAUSE" mapto="pauseSub" flags="m" />
 		<key id="KEY_PLAY" mapto="resumeSub" flags="m"/>
 		<key id="KEY_PLAYPAUSE" mapto="playPauseSub" flags="m"/>
-		<key id="KEY_RED" mapto="openSubtitlePicker" flags="m"/> 
-		<!--key id="KEY_GREEN" mapto="translateNow" flags="m" /-->
+		<key id="KEY_RED" mapto="openSubtitlePicker" flags="m"/>
 		<key id="KEY_YELLOW" mapto="eventSync" flags="m" />
 		<key id="KEY_BLUE" mapto="changeFps" flags="m" />
 		<key id="KEY_OK" mapto="showHideStatus" flags="m"/>
 		<key id="KEY_EXIT" mapto="confirmClose" flags="m"/>
 		<key id="KEY_ESC" mapto="confirmClose" flags="m"/>
-		<!--key id="KEY_CHANNELUP" mapto="channelPlusPressed" flags="mr" />
-		<key id="KEY_CHANNELDOWN" mapto="channelMinusPressed" flags="mr" /-->
 		<key id="KEY_INFO" mapto="showHelp" flags="m" />
 		<key id="KEY_MENU" mapto="externalStyle" flags="m" />
 	</map>
