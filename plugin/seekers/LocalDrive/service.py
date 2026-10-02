@@ -5,7 +5,7 @@ import re
 
 from ..utilities import languageTranslate, log, saveSubtitle, yearMatch
 
-SUBTITLE_EXTENSIONS = (".srt", ".sub")
+SUBTITLE_EXTENSIONS = (".srt", ".sub", ".ass", ".ssa")
 MAX_DEPTH = 3
 
 settings_provider = None

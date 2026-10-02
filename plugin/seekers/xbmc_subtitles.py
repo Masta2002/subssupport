@@ -153,6 +153,24 @@ class YtssubsSeeker(XBMCSubtitlesAdapter):
 
 
 try:
+    from .Justsubtitles import justsubtitles
+except ImportError as e:
+    justsubtitles = e
+
+
+class JustsubtitlesSeeker(XBMCSubtitlesAdapter):
+    id = 'justsubtitles'
+    module = justsubtitles
+    if isinstance(module, Exception):
+        error, module = module, None
+    provider_name = 'JustSubtitles'
+    supported_langs = ['en', 'ar', 'de', 'it', 'id', 'ja', 'ko']
+    default_settings = {}
+    movie_search = True
+    tvshow_search = False
+
+
+try:
     from .LocalDrive import localdrive
 except ImportError as e:
     localdrive = e
@@ -253,6 +271,23 @@ class SubdlSeeker(XBMCSubtitlesAdapter):
     supported_langs = allLang()
     default_settings = {'Subdl_API_KEY': {'label': _("API key"), 'type': 'text', 'default': '', 'pos': 0}}
     required_settings = ('Subdl_API_KEY',)
+
+
+try:
+    from .Wyzie import wyzie
+except ImportError as e:
+    wyzie = e
+
+
+class WyzieSeeker(XBMCSubtitlesAdapter):
+    module = wyzie
+    if isinstance(module, Exception):
+        error, module = module, None
+    id = 'wyzie'
+    provider_name = 'Wyzie Subs'
+    supported_langs = allLang()
+    default_settings = {'Wyzie_API_KEY': {'label': _("API key"), 'type': 'text', 'default': '', 'pos': 0}}
+    required_settings = ('Wyzie_API_KEY',)
 
 
 try:

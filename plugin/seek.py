@@ -29,7 +29,7 @@ try:
     from .seekers import SubtitlesDownloadError, SubtitlesSearchError, \
         SubtitlesErrors, SubtitlesmoraSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
         Subf2mSeeker, LocalDriveSeeker, IndexsubtitleSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
-        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker
+        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, JustsubtitlesSeeker, WyzieSeeker
     from .seekers.seeker import BaseSeeker
     from .seekers.utilities import languageTranslate, langToCountry, \
         getCompressedFileType, detectSearchParams
@@ -38,7 +38,7 @@ except (ValueError, ImportError):  # searchsubs.py runs seek.py as a top-level m
     from seekers import SubtitlesDownloadError, SubtitlesSearchError, \
         SubtitlesErrors, SubtitlesmoraSeeker, SubtitlecatSeeker, OpenSubtitles2Seeker, TitulkyComSeeker, \
         Subf2mSeeker, LocalDriveSeeker, IndexsubtitleSeeker, MoviesubtitlesSeeker, Sub_Scene_comSeeker, SubdlSeeker, \
-        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker
+        TitloviSeeker, PrijevodiOnlineSeeker, MySubsSeeker, SubsourceSeeker, YtssubsSeeker, JustsubtitlesSeeker, WyzieSeeker
     from seekers.seeker import BaseSeeker
     from seekers.utilities import languageTranslate, langToCountry, \
         getCompressedFileType, detectSearchParams
@@ -50,8 +50,10 @@ SUBTITLES_SEEKERS.append(LocalDriveSeeker)
 SUBTITLES_SEEKERS.append(SubsourceSeeker)
 SUBTITLES_SEEKERS.append(SubdlSeeker)
 SUBTITLES_SEEKERS.append(OpenSubtitles2Seeker)
+SUBTITLES_SEEKERS.append(WyzieSeeker)
 SUBTITLES_SEEKERS.append(SubtitlesmoraSeeker)
 SUBTITLES_SEEKERS.append(YtssubsSeeker)
+SUBTITLES_SEEKERS.append(JustsubtitlesSeeker)
 SUBTITLES_SEEKERS.append(IndexsubtitleSeeker)
 SUBTITLES_SEEKERS.append(MoviesubtitlesSeeker)
 SUBTITLES_SEEKERS.append(SubtitlecatSeeker)
@@ -80,7 +82,7 @@ class ErrorSeeker(BaseSeeker):
 
 
 class SubsSeeker(object):
-    SUBTILES_EXTENSIONS = ['.srt', '.sub']
+    SUBTILES_EXTENSIONS = ['.srt', '.sub', '.ass', '.ssa']
 
     def __init__(self, download_path, tmp_path, captcha_cb, delay_cb, message_cb, settings=None, settings_provider_cls=None, settings_provider_args=None, debug=False, providers=None):
         self.log = SimpleLogger(self.__class__.__name__, log_level=debug and SimpleLogger.LOG_DEBUG or SimpleLogger.LOG_INFO)

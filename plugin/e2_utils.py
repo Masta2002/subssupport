@@ -15,14 +15,12 @@
 #    GNU General Public License for more details.
 #
 #################################################################################
-from __future__ import absolute_import
-from __future__ import print_function
 from . import _
 import os
 import shutil
 import requests
 from twisted.internet.threads import deferToThread
-import xml.etree.cElementTree
+from xml.etree.ElementTree import parse as parse_xml
 from Components.Label import Label
 from Components.ConfigList import ConfigList
 from Components.Sources.StaticText import StaticText
@@ -58,7 +56,6 @@ def getPage(url, params=None, headers=None, cookies=None, timeout=None):
     timeout = timeout or 30.05
     headers["user-agent"] = "Mozilla/5.0 Gecko/20100101 Firefox/100.0"
     return deferToThread(requests.get, url, params=params, headers=headers, cookies=cookies, timeout=timeout)
-
 
 def getDesktopSize():
     s = getDesktop(0).size()
@@ -443,46 +440,72 @@ def getFonts():
     global FONTS
     if len(FONTS) > 0:
         return FONTS.keys()
+
     allFonts = []
+
+    # 1) System fonts (existing logic)
     fontDir = eEnv.resolve("${datadir}/fonts/")
     print('[getFonts] fontDir: %s' % fontDir)
-    for font in os.listdir(fontDir):
-        fontPath = os.path.join(fontDir, font)
-        if os.path.isdir(fontPath):
-            for f in os.listdir(fontPath):
-                if not f.endswith(".ttf"):
-                    continue
-                allFonts.append(os.path.join(fontPath, f))
-        if not fontPath.endswith(".ttf"):
-            continue
-        allFonts.append(fontPath)
+
+    if os.path.isdir(fontDir):
+        for font in os.listdir(fontDir):
+            fontPath = os.path.join(fontDir, font)
+            if os.path.isdir(fontPath):
+                for f in os.listdir(fontPath):
+                    if f.lower().endswith(".ttf"):
+                        allFonts.append(os.path.join(fontPath, f))
+            elif fontPath.lower().endswith(".ttf"):
+                allFonts.append(fontPath)
+
+    # 2) Plugin fonts (SubsSupport only) -> register with prefix to avoid clashes
+    pluginFontDir = os.path.join(os.path.dirname(__file__), "fonts", "")
+    if os.path.isdir(pluginFontDir):
+        for f in os.listdir(pluginFontDir):
+            if f.lower().endswith((".ttf", ".otf")):
+                allFonts.append(os.path.join(pluginFontDir, f))
+
+    # Skin font name mapping (existing logic)
     skinFiles = ["skin_default.xml", "skin_subtitles.xml", "skin_user.xml"]
     fonts = {}
     for skinFile in skinFiles:
         skinPath = resolveFilename(SCOPE_SKIN, skinFile)
         if fileExists(skinPath):
             try:
-                skin = xml.etree.cElementTree.parse(skinPath).getroot()
+                skin = parse_xml(skinPath).getroot()
             except Exception as e:
                 print(e)
                 continue
             for c in skin.findall("fonts"):
                 for font in c.findall("font"):
                     get_attr = font.attrib.get
-                    filename = get_attr("filename", "<NONAME>")
+                    filename = get_attr("filename", "")
                     name = get_attr("name", "Regular")
                     fonts[filename] = name
                     print('[getFonts] find font %s in %s' % (name, skinFile))
+
+    # Register fonts
     for fontFilepath in allFonts:
         fontFilename = os.path.basename(fontFilepath)
+
+        # If font comes from plugin folder -> force prefixed name
+        if fontFilepath.startswith(pluginFontDir):
+            base = os.path.splitext(fontFilename)[0]
+            fontName = "SS_" + base
+            addFont(fontFilepath, fontName, 100, False)
+            FONTS[fontName] = fontFilepath
+            continue
+
+        # Existing behavior for system fonts
         if fontFilename not in fonts.keys():
             fontName = os.path.splitext(fontFilename)[0]
             addFont(fontFilepath, fontName, 100, False)
             FONTS[fontName] = fontFilepath
         else:
             FONTS[fonts[fontFilename]] = fontFilename
+
     if "Regular" not in FONTS:
         FONTS["Regular"] = ""
+
     return FONTS.keys()
 
 
